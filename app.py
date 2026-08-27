@@ -5,11 +5,19 @@ from fastapi.middleware.cors import CORSMiddleware # for autocomplete
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.status import HTTP_404_NOT_FOUND
 import uvicorn
 import httpx
 from pylti.common import verify_request_common, LTIException
 from dotenv import load_dotenv
+from lti13 import (
+    bounded_env_int,
+    consume_lti11_nonce,
+    create_lti13_service,
+    env_flag,
+    read_request_data,
+)
 
 
 # gradio_app.pyのASGIアプリをインポート！
@@ -24,23 +32,46 @@ import gradio as gr
 
 from fastapi.templating import Jinja2Templates
 
-app = FastAPI() # main app
-router = APIRouter()
-
-app.add_middleware( # for autocomplete TODO add API key
-        CORSMiddleware,
-        allow_origins=["*"],  # Allow all origins (you can restrict it to specific domains)
-        allow_credentials=True,
-        allow_methods=["*"],  # Allow all HTTP methods (GET, POST, etc.)
-        allow_headers=["*"],  # Allow all headers
-    )
-
-# Load environment variables from .env file
 load_dotenv()
 
-path_prefix = os.getenv("APP_PATH_PREFIX", "default_path")
+app = FastAPI()
+router = APIRouter()
 
-app.add_middleware(SessionMiddleware, secret_key=os.environ.get('FASTAPI_SECRET_KEY'))
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
+    )
+
+allowed_hosts = [
+    host.strip()
+    for host in os.getenv("ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
+    if host.strip()
+]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+path_prefix = os.getenv("APP_PATH_PREFIX", "mathquizgen").strip("/")
+session_secret = os.getenv("FASTAPI_SECRET_KEY", "")
+if len(session_secret) < 32:
+    raise RuntimeError("FASTAPI_SECRET_KEY must contain at least 32 characters.")
+session_https_only = env_flag("SESSION_HTTPS_ONLY", False)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=session_secret,
+    https_only=session_https_only,
+    same_site="none" if session_https_only else "lax",
+    max_age=bounded_env_int(
+        "SESSION_MAX_AGE_SECONDS", default=28800, minimum=300, maximum=86400
+    ),
+)
 
 @app.on_event("startup")
 def startup_event():
@@ -68,8 +99,14 @@ def get_browser_language(request: Request):
 
 # Set up Jinja2 templates
 templates = Jinja2Templates(directory="templates")
+mongo_url = os.getenv("MONGO_URL", "")
+if not mongo_url:
+    raise RuntimeError("MONGO_URL is required.")
+lti13_service = create_lti13_service(mongo_url, path_prefix)
 
-LTI_URL = f"https://lab.let.media.kyoto-u.ac.jp/{path_prefix}/lti/login"
+LTI_URL = os.getenv(
+    "LTI_URL", f"https://lab.let.media.kyoto-u.ac.jp/{path_prefix}/lti/login"
+)
 
 css = """
 h1 {
@@ -79,33 +116,32 @@ h1 {
 """
 ###########################
 
-# Function to load all LTI credentials from environment variables
-max_number = os.environ.get('MAX_GENERATION')
 def load_lti_credentials():
     consumers = {}
-    i = 1
-    while True:
-        key = os.getenv(f'LTI_CONSUMER_KEY_{i}')
-        secret = os.getenv(f'LTI_SHARED_SECRET_{i}')
-        if not key or not secret:
-            break
-        consumers[key] = {"secret": secret}
-        i += 1
-        if i == max_number:
-            break
+    try:
+        maximum = min(max(int(os.getenv("MAX_GENERATION", "100")), 1), 100)
+    except ValueError:
+        maximum = 100
+    for index in range(1, maximum + 1):
+        key = os.getenv(f"LTI_CONSUMER_KEY_{index}")
+        secret = os.getenv(f"LTI_SHARED_SECRET_{index}")
+        if key and secret:
+            consumers[key] = {"secret": secret}
     return consumers
 
-# Load all LTI consumers at startup
+
 LTI_CONSUMERS = load_lti_credentials()
 
 # LTI Request validation
 async def validate_lti_request(request: Request):
-    # First, ensure you await the form data from the request
-    form_data = await request.form()
+    form_data = await read_request_data(request)
+    if form_data.get("oauth_signature_method") != "HMAC-SHA1":
+        print("[LTI 1.1] Unsupported signature method rejected")
+        return False
 
     # dictionary of consumers
     consumers = LTI_CONSUMERS
-    print("[104] Validating LTI request")
+    print("[LTI 1.1] Validating signed launch request")
     common_request_verification = False
 
     try: 
@@ -117,10 +153,15 @@ async def validate_lti_request(request: Request):
             headers=dict(request.headers),
             params=dict(form_data)  # Ensure this is a dict if not already
         )
-        print("[116] LTI request validation successful")
+        if common_request_verification and not consume_lti11_nonce(
+            lti13_service.repository.database, form_data
+        ):
+            print("[LTI 1.1] Launch replay or invalid timestamp rejected")
+            return False
+        print("[LTI 1.1] Launch signature and nonce validated")
 
-    except LTIException as e:
-        print(f"[119] LTI validation failed: {e}")
+    except LTIException:
+        print("[LTI 1.1] Launch signature validation failed")
 
     return common_request_verification
 
@@ -129,27 +170,28 @@ async def get_current_user(request: Request): # Dependsと関わってくる
     user = request.session.get('user', {})
 
     if not user:
-        print(f"[128] Not authenticated. Request: {request}")
+        print("[Auth] Request has no authenticated session")
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
+
+def gradio_auth_dependency(request: Request):
+    user = request.session.get("user", {})
+    user_id = user.get("user_id") if isinstance(user, dict) else None
+    return str(user_id) if user_id else None
 
 
 ####################################### apps in separate dockers
 
 @app.exception_handler(Exception)
 async def universal_exception_handler(request: Request, exc: Exception):
-    # Log the error if needed
-    print(f"[138] Unhandled exception in FastAPI routing: {exc} for {request}")
-
-    # Check the type of exception and handle it accordingly
-    if isinstance(exc, HTTPException):
-        status_code = exc.status_code
-    else:
-        status_code = 500  # Default to 500 for all other exceptions
-    
+    print(
+        f"[Error] Unhandled {type(exc).__name__} on "
+        f"{request.method} {request.url.path}"
+    )
+    status_code = exc.status_code if isinstance(exc, HTTPException) else 500
     return JSONResponse(
-        status_code,
-        content={"detail": "サーバー内部でエラーが発生しました"}
+        status_code=status_code,
+        content={"detail": "サーバー内部でエラーが発生しました"},
     )
 
 # Create a single client for each service to be reused
@@ -182,7 +224,7 @@ async def get_httpx_client(base_url: str):
 @app.middleware("http") 
 async def log_request(request: Request, call_next):
     response = await call_next(request)
-    print(f"[181] Request: {request.method} {request.url} - Response: {response.status_code}")
+    print(f"[HTTP] {request.method} {request.url.path} -> {response.status_code}")
     return response
 
 async def stream_response(response):
@@ -224,48 +266,56 @@ async def proxy_request(client, request: Request, path: str):
 
 ####### LTI #############################################################################
 
-@app.post(f'/{path_prefix}/lti/login') #/mathgen/lti/login に「POST」でアクセスされた時だけ、この関数が呼ばれます。
+@app.api_route(f"/{path_prefix}/lti/1p3/login", methods=["GET", "POST"])
+async def lti13_login(request: Request):
+    return await lti13_service.oidc_login(request)
+
+
+@app.post(f"/{path_prefix}/lti/1p3/launch")
+async def lti13_launch(request: Request):
+    return await lti13_service.launch(request)
+
+
+@app.get(f"/{path_prefix}/lti/1p3/jwks")
+async def lti13_jwks():
+    return lti13_service.jwks_response()
+
+
+@app.get(f"/{path_prefix}/lti/status")
+async def lti_status():
+    return lti13_service.status_response()
+
+
+@app.post(f"/{path_prefix}/lti/login")
 async def lti_launch(request: Request):
-    print(f"[225] Validating LTI request. Request headers: {dict(request.headers)}")
-    valid = await validate_lti_request(request) #ltiリクエストをpostする
+    valid = await validate_lti_request(request)
     if not valid:
-        return {'error': 'Invalid LTI request'} 
+        raise HTTPException(status_code=401, detail="Invalid LTI 1.1 request")
 
-    # Extracting additional fields from the form data
     form_data = await request.form()
+    user_id = str(form_data.get("user_id", "")).strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="LTI 1.1 user_id is required")
 
-    user_id = form_data.get('user_id')
-    roles = form_data.get('roles', 'unknown')
-    oauth_consumer_key = form_data.get('oauth_consumer_key', 'unknown')
-    context_id = form_data.get('context_id', 'unknown')
-    context_title = form_data.get('context_title', 'unknown')
-    if user_id:
-
-        print(f"[250] LTI launch successful for user {user_id}")
-
-        browser_language=get_browser_language(request)
-        school = "unknown"
-        if oauth_consumer_key:
-            school = oauth_consumer_key
-
-        # Extending user information in session including new fields
-        user_info = {
-            'user_id': user_id,
-            'roles': roles,
-            'browser_language': browser_language,
-            'oauth_consumer_key': oauth_consumer_key,
-            'context_id': context_id,
-            'context_title': context_title,
-            'school_id': school
-        }
-        print(f"[286] Successful LTI login: {user_info}")
-        request.session['user'] = user_info
-
-
-        return RedirectResponse(url=f'/{path_prefix}/ui/', status_code=status.HTTP_303_SEE_OTHER)
-    
-    print("[292] User ID missing in LTI request")
-    return {'error': 'User ID missing in LTI request'}
+    roles = str(form_data.get("roles", "unknown"))
+    oauth_consumer_key = str(form_data.get("oauth_consumer_key", "unknown"))
+    context_id = str(form_data.get("context_id", "unknown"))
+    context_title = str(form_data.get("context_title", "unknown"))
+    request.session.clear()
+    request.session["user"] = {
+        "user_id": user_id,
+        "roles": roles,
+        "browser_language": get_browser_language(request),
+        "oauth_consumer_key": oauth_consumer_key,
+        "context_id": context_id,
+        "context_title": context_title,
+        "school_id": oauth_consumer_key,
+        "lti_version": "1.1",
+    }
+    print("[LTI 1.1] Authenticated launch accepted")
+    return RedirectResponse(
+        url=f"/{path_prefix}/ui/", status_code=status.HTTP_303_SEE_OTHER
+    )
 
 @router.get("/go-to-gradio")
 async def go_to_gradio():
@@ -274,7 +324,13 @@ async def go_to_gradio():
 app.include_router(router, prefix=f"/{path_prefix}")
 
 # Gradio Mount（/ui以下はGradio専用にする！）
-mount_gradio_app(app, demo1, path=f"/{path_prefix}/ui", root_path=f"/{path_prefix}/ui")
+mount_gradio_app(
+    app,
+    demo1,
+    path=f"/{path_prefix}/ui",
+    root_path=f"/{path_prefix}/ui",
+    auth_dependency=gradio_auth_dependency,
+)
 
 if __name__ == '__main__':
     uvicorn.run(app, root_path=f"/{path_prefix}")

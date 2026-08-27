@@ -29,8 +29,17 @@ def load_session_info(request: gr.Request):
     user = lti['user_id']
     return lti, user
 
-# openaiのapi情報
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+openai_client = None
+
+
+def get_openai_client():
+    global openai_client
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for evaluation.")
+    if openai_client is None:
+        openai_client = OpenAI(api_key=api_key)
+    return openai_client
 models = ["gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "o1-preview", "o1-mini", "o3-mini"]
 
 # genaiのapiを走らせる
@@ -38,7 +47,7 @@ def gpt_exection(model, query):
     '''
     str: model, str: query
     '''
-    completion = openai_client.chat.completions.create(
+    completion = get_openai_client().chat.completions.create(
         model=model,
         messages=[
             {

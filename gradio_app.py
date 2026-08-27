@@ -43,9 +43,28 @@ def load_session_info(request: gr.Request):
     user = lti['user_id']
     return lti, user
 
-# openaiのapi情報
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+openai_client = None
+genai_client = None
+
+
+def get_openai_client():
+    global openai_client
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for OpenAI generation.")
+    if openai_client is None:
+        openai_client = OpenAI(api_key=api_key)
+    return openai_client
+
+
+def get_genai_client():
+    global genai_client
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is required for Gemini generation.")
+    if genai_client is None:
+        genai_client = genai.Client(api_key=api_key)
+    return genai_client
 
 def get_journey_html(lti):
     if not lti or "user_id" not in lti:
@@ -213,7 +232,7 @@ def gpt_exection(model, query):
     str: model, str: query
     '''
     if model in ["gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "o1-preview", "o1-mini", "o3-mini", "o4-mini", "gpt-5", "gpt-4.1-nano"]:
-        completion = openai_client.chat.completions.create(
+        completion = get_openai_client().chat.completions.create(
             model=model,
             messages=[
                 {
@@ -223,7 +242,7 @@ def gpt_exection(model, query):
         )
         response = completion.choices[0].message.content
     else:
-        ans = genai_client.models.generate_content(
+        ans = get_genai_client().models.generate_content(
         model=model, contents = query
         )
         response = ans.text
