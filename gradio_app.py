@@ -5,13 +5,18 @@ import random
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
-from pymongo import MongoClient
+from pymongo import MongoClient, ReplaceOne, timeout
+from pymongo.errors import PyMongoError
+from pydantic import ValidationError
 import uuid
 import json
 import base64
 import clickhouse_connect
 from google import genai
 import re
+from functools import wraps
+from inspect import signature
+from prime_repository import AccessDenied, PrimeStore, Scope, QUERY_MS, QUESTION_SCAN_LIMIT, HISTORY_SCAN_LIMIT
 
 JST = timezone(timedelta(hours=9))
 
@@ -25,6 +30,153 @@ quiz_generator_db = mongo_client["prime"]
 exercise_col = quiz_generator_db["question_bank"]
 history_col = quiz_generator_db["history"]
 logs_col = quiz_generator_db["logs"]
+xapi_col = quiz_generator_db["xAPI"]
+
+
+def _prime_lti_scope(lti):
+    return Scope(
+        platform_issuer=lti["lti_issuer"], client_id=lti["lti_client_id"],
+        deployment_id=lti["lti_deployment_id"], learner_id=lti["user_id"],
+        course_id=lti["context_id"],
+    )
+
+
+def _prime_mongo_budget(callback):
+    """One absolute Mongo budget, including nested reads, for native 1.3 callbacks."""
+    lti_index = list(signature(callback).parameters).index("lti")
+
+    @wraps(callback)
+    def bounded(*args, **kwargs):
+        lti = kwargs.get("lti") if "lti" in kwargs else args[lti_index]
+        if lti and lti.get("lti_version") == "1.3":
+            try:
+                with timeout(QUERY_MS / 1000):
+                    return callback(*args, **kwargs)
+            except (PyMongoError, AccessDenied, ValidationError) as error:
+                print(f"Native PRIME operation failed: {type(error).__name__}")
+                raise gr.Error("PRIME is unavailable for this course. Please ask your teacher to check the connection.") from None
+        return callback(*args, **kwargs)
+
+    return bounded
+
+
+def _prime_authorized_lti(lti):
+    if lti.get("lti_version") != "1.3":
+        return lti
+    scope = _prime_lti_scope(lti)
+    PrimeStore(quiz_generator_db).authorize(scope)
+    return {**lti, "school_id": scope.school_id, "context_id": scope.course_id,
+            "user_id": scope.learner_id}
+
+
+def _native_text_projection(path, maximum):
+    return {"$substrCP": [{"$cond": [
+        {"$eq": [{"$type": path}, "string"]}, path, "",
+    ]}, 0, maximum]}
+
+
+def _native_history_notice(truncated):
+    notice = f"現在のコースの自分の直近最大{HISTORY_SCAN_LIMIT}件の記録のみを表示・集計しています。全期間の履歴やクラスのデータではありません。自己申告であり、正答や習得度の判定ではありません。"
+    if truncated:
+        notice += " 古い記録は省略されています。"
+    return notice
+
+
+@_prime_mongo_budget
+def _scoped_exercise_info(lti, reference):
+    if lti.get("lti_version") == "1.3":
+        store = PrimeStore(quiz_generator_db)
+        scope = _prime_lti_scope(lti)
+        store.authorize(scope)
+        # Only scalar question references may become database predicates.
+        if (any(not isinstance(reference.get(key), (str, int)) or isinstance(reference.get(key), bool)
+                or not str(reference.get(key)) or len(str(reference.get(key))) > 512
+                for key in ("contents_id", "page", "no"))
+                or not isinstance(reference.get("contents_id"), str)):
+            raise gr.Error("The selected question is no longer available.")
+        selected = {key: reference[key] for key in ("contents_id", "page", "no")}
+        if selected["contents_id"] == "ai_generated":
+            selected.update(user=scope.learner_id, course_id=scope.course_id,
+                            page=scope.learner_id)
+            if reference["page"] != scope.learner_id:
+                raise gr.Error("The selected question is no longer available.")
+        projection = {
+            "_id": 0, "isfigure": {"$eq": ["$isfigure", True]},
+            **{key: _native_text_projection(f"${key}", 12000)
+               for key in ("standard_answer", "quiz_ans", "answer", "figure_explanation")},
+            "rubric": {"$arrayToObject": {"$map": {
+                "input": {"$slice": [{"$objectToArray": {"$cond": [
+                    {"$eq": [{"$type": "$rubric"}, "object"]}, "$rubric", {},
+                ]}}, 20]},
+                "as": "step",
+                "in": {"k": _native_text_projection("$$step.k", 512),
+                       "v": {"main": _native_text_projection("$$step.v.main", 512)}},
+            }}},
+        }
+        projection["detail_truncated"] = {"$or": [
+            *[{"$gt": [{"$strLenCP": {"$cond": [
+                {"$eq": [{"$type": f"${key}"}, "string"]}, f"${key}", "",
+            ]}}, 12000]} for key in ("standard_answer", "quiz_ans", "answer", "figure_explanation")],
+            {"$gt": [{"$size": {"$objectToArray": {"$cond": [
+                {"$eq": [{"$type": "$rubric"}, "object"]}, "$rubric", {},
+            ]}}}, 20]},
+            {"$anyElementTrue": [{"$map": {
+                "input": {"$slice": [{"$objectToArray": {"$cond": [
+                    {"$eq": [{"$type": "$rubric"}, "object"]}, "$rubric", {},
+                ]}}, 20]},
+                "as": "step",
+                "in": {"$gt": [{"$strLenCP": {"$cond": [
+                    {"$eq": [{"$type": "$$step.v.main"}, "string"]}, "$$step.v.main", "",
+                ]}}, 512]},
+            }}]},
+        ]}
+        documents = list(exercise_col.aggregate([
+            {"$match": {"$and": [store.question_scope(scope), selected]}},
+            {"$sort": {"_id": 1}}, {"$limit": 1}, {"$project": projection},
+        ], maxTimeMS=QUERY_MS))
+        document = documents[0] if documents else None
+        if document:
+            if document.pop("detail_truncated", False):
+                gr.Info("問題の詳細は文字数・項目数上限のある表示です。長い解答・説明または解答のポイントが省略されています。")
+            document["standard_answer"] = (document["standard_answer"]
+                                           or document["quiz_ans"] or document["answer"])
+    else:
+        document = exercise_col.find_one(reference)
+    if document is None:
+        raise gr.Error("The selected question is no longer available.")
+    return document
+
+# database選択
+CLICKHOUSE_CONFIGS = {}
+_i = 1
+while True:
+    _key = os.getenv(f"LTI_CONSUMER_KEY_{_i}")
+    if not _key:
+        break
+    CLICKHOUSE_CONFIGS[_key] = {
+        "host": os.getenv(f"BOOKROLL_DATABASE_HOST_{_i}"),
+        "username": os.getenv(f"BOOKROLL_DATABASE_USER_{_i}"),
+        "password": os.getenv(f"BOOKROLL_DATABASE_PASS_{_i}"),
+        "db_name": os.getenv(f"BOOKROLL_DATABASE_NAME_{_i}", "saikyo_new")  # 指定がなければ saikyo_new
+    }
+    _i += 1
+
+def get_clickhouse_client_and_db(school_id):
+    """school_idに対応するClickHouseクライアントとデータベース名を返す"""
+    config = CLICKHOUSE_CONFIGS.get(school_id)
+    if not config:
+        return None, None
+    try:
+        client = clickhouse_connect.get_client(
+            host=config["host"],
+            username=config["username"],
+            password=config["password"]
+        )
+        return client, config["db_name"]
+    except Exception as e:
+        print(f"ClickHouse Connection Error for {school_id}: {e}")
+        return None, None
+# --------------------------------------------------------
 
 #ltiセッション情報読み込み
 def load_session_info(request: gr.Request):
@@ -45,6 +197,7 @@ def load_session_info(request: gr.Request):
 
 openai_client = None
 genai_client = None
+llmjp_client = None
 
 
 def get_openai_client():
@@ -66,25 +219,42 @@ def get_genai_client():
         genai_client = genai.Client(api_key=api_key)
     return genai_client
 
+
+def get_llmjp_client():
+    global llmjp_client
+    api_key = os.getenv("LLM_JP_API_KEY")
+    if not api_key:
+        raise RuntimeError("LLM_JP_API_KEY is required for LLM-JP generation.")
+    if llmjp_client is None:
+        llmjp_client = OpenAI(
+            base_url="https://llm-jp-playground.apps.llmc.nii.ac.jp/api/v1",
+            api_key=api_key,
+        )
+    return llmjp_client
+
+@_prime_mongo_budget
 def get_journey_html(lti):
     if not lti or "user_id" not in lti:
         return gr.update(value="")
 
+    lti = _prime_authorized_lti(lti)
+    native = lti.get("lti_version") == "1.3"
     user_id = str(lti["user_id"])
     school_id = str(lti["school_id"])
-
+    course_id = str(lti.get("context_id", ""))
+    history_truncated = False
     all_history = []
 
-    # 1. ClickHouse (元の問題の履歴)
-    if school_id == os.getenv("LTI_CONSUMER_KEY_1"):
+    # -----------------------------------------------------------
+    # 1. ClickHouse (元の問題の履歴 ＆ マーカーのカウント)
+    # -----------------------------------------------------------
+    clickhouse_client, db_name = (None, None) if native else get_clickhouse_client_and_db(school_id)
+    marker_pages_count = 0
+
+    if clickhouse_client and db_name:
+        # A. 元の問題の解答履歴を取得
         try:
-            clickhouse_client = clickhouse_connect.get_client(
-                host=os.getenv("BOOKROLL_DATABASE_HOST_1"),
-                username=os.getenv("BOOKROLL_DATABASE_USER_1"),
-                password=os.getenv("BOOKROLL_DATABASE_PASS_1")
-            )
-            # ＝＝＝ 変更：contents_id と page_no も一緒に取得する ＝＝＝
-            sql = "SELECT contents_id, page_no, CAST(results_response AS String), timestamp FROM saikyo_new.statements_target WHERE actor_name_id = {user:String} AND operation_name = 'ANSWER_QUIZ' ORDER BY timestamp ASC"
+            sql = f"SELECT contents_id, page_no, CAST(results_response AS String), timestamp FROM {db_name}.statements_target WHERE actor_name_id = {{user:String}} AND operation_name = 'ANSWER_QUIZ' ORDER BY timestamp ASC"
             res = clickhouse_client.query(sql, {"user": user_id})
             for row in res.result_rows:
                 c_id = str(row[0]) if row[0] else ""
@@ -94,28 +264,66 @@ def get_journey_html(lti):
                 else:
                     p_no = str(raw_page).replace('\x00', '').strip() if raw_page else ""
                 
-                # 問題を特定するユニークなキーを作成
                 q_key = f"{c_id}_{p_no}"
                 all_history.append({"type": "original", "q_key": q_key, "result": str(row[2]) if row[2] else "", "timestamp": row[3]})
         except Exception as e:
             print(f"ClickHouse journey fetch failed: {e}")
 
+        # B. ADD_MARKERログが存在するページ数のカウント
+        course_contents_ids = set()
+        try:
+            for doc in exercise_col.find({"course_id": course_id}, {"contents_id": 1}):
+                c_id = doc.get("contents_id")
+                if c_id and c_id != "ai_generated":
+                    course_contents_ids.add(c_id)
+        except Exception as e:
+            pass
+
+        if course_contents_ids:
+            try:
+                # 修正: 'ADD_MARKER' のログが存在する(contents_id, page_no)の組み合わせの数をカウントする
+                sql_marker = f"""
+                SELECT count()
+                FROM (
+                    SELECT contents_id, page_no
+                    FROM {db_name}.statements_target
+                    WHERE actor_name_id = {{user:String}}
+                      AND contents_id IN {{contents_list:Array(String)}}
+                      AND operation_name = 'ADD_MARKER'
+                    GROUP BY contents_id, page_no
+                )
+                """
+                res_marker = clickhouse_client.query(sql_marker, {"user": user_id, "contents_list": list(course_contents_ids)})
+                if res_marker.result_rows:
+                    marker_pages_count = int(res_marker.result_rows[0][0])
+            except Exception as e:
+                print(f"ClickHouse marker count fetch failed: {e}")
+
+    # -----------------------------------------------------------
     # 2. MongoDB (元の問題・復習問題の履歴)
+    # -----------------------------------------------------------
     try:
-        docs = list(history_col.find({"school_id": school_id, "user": user_id}))
+        if native:
+            reports, history_truncated = PrimeStore(quiz_generator_db).native_report_window(_prime_lti_scope(lti))
+            docs = [{**doc, "timestamp": stamp} for stamp, doc in reports]
+        else:
+            query = {"school_id": school_id, "user": user_id}
+            docs = list(history_col.find(query))
         for doc in docs:
             c_id = str(doc.get("contents_id", ""))
             p_no = str(doc.get("page", ""))
             n_no = str(doc.get("no", ""))
             q_type = "review" if c_id == "ai_generated" else "original"
-            # 問題を特定するユニークなキーを作成
             q_key = f"{c_id}_{p_no}_{n_no}"
             
             all_history.append({"type": q_type, "q_key": q_key, "result": doc.get("understanding", ""), "timestamp": doc.get("timestamp")})
     except Exception as e:
+        if native:
+            print(f"Native journey read failed: {type(e).__name__}")
+            raise gr.Error("Recent history is temporarily unavailable.") from None
         print(f"Mongo journey fetch failed: {e}")
 
-    # 3. タイムスタンプでソート
+    # タイムスタンプでソート
     def normalize_tz(dt):
         if not dt: return datetime.min.replace(tzinfo=timezone.utc)
         if isinstance(dt, str):
@@ -126,16 +334,16 @@ def get_journey_html(lti):
     try: all_history.sort(key=lambda x: normalize_tz(x["timestamp"]))
     except: pass
 
-    # --- カウントと距離の計算 ---
-    orig_green = orig_yellow = orig_red = 0
-    rev_green = rev_yellow = rev_red = 0
-    
-    # ＝＝＝ 追加：演習（元の問題）の最新結果を保持する辞書 ＝＝＝
+    # -----------------------------------------------------------
+    # 3. 最新のステータスだけを残す (演習も類題も)
+    # -----------------------------------------------------------
     latest_orig_results = {}
+    latest_rev_results = {}
 
     for x in all_history:
         res = str(x.get("result", ""))
-        is_orig = (x["type"] == "original")
+        q_type = x["type"]
+        q_key = x.get("q_key", "")
         
         status = None
         if "まったく" in res or "わから" in res or "不正解" in res:
@@ -146,31 +354,39 @@ def get_journey_html(lti):
             status = "green"
 
         if status:
-            if is_orig:
-                # 演習の場合は辞書を上書きし、常にその問題の最新の成績を保持する
-                q_key = x.get("q_key", "")
-                if q_key:
-                    latest_orig_results[q_key] = status
+            if q_type == "original":
+                latest_orig_results[q_key] = status
             else:
-                # 復習（AI生成の類題）の場合は、すべて加算する
-                if status == "red": rev_red += 1
-                elif status == "yellow": rev_yellow += 1
-                elif status == "green": rev_green += 1
+                latest_rev_results[q_key] = status
 
-    # 辞書に残った「最新のステータス」をカウント
+    # それぞれのカウント
+    orig_green = orig_yellow = orig_red = 0
+    rev_green = rev_yellow = rev_red = 0
+
     for status in latest_orig_results.values():
         if status == "red": orig_red += 1
         elif status == "yellow": orig_yellow += 1
         elif status == "green": orig_green += 1
 
+    for status in latest_rev_results.values():
+        if status == "red": rev_red += 1
+        elif status == "yellow": rev_yellow += 1
+        elif status == "green": rev_green += 1
+
     total_work = orig_green + orig_yellow + orig_red
     total_review = rev_green + rev_yellow + rev_red
-    distance = (29 * orig_green) + (19 * orig_yellow) + (7 * orig_red) + (23 * rev_green) + (17 * rev_yellow) + (5 * rev_red)
+    
+    # 距離の計算 (元の問題のポイント + 類題のポイント + マーカーのページ数×2)
+    distance = (29 * orig_green) + (19 * orig_yellow) + (7 * orig_red) \
+             + (23 * rev_green) + (17 * rev_yellow) + (5 * rev_red) \
+             + (marker_pages_count * 2)
 
-    # --- 🔄 周回ロジック ---
+    # -----------------------------------------------------------
+    # 4. 🔄 周回ロジック と UI生成
+    # -----------------------------------------------------------
     lap_length = 79037
-    lap_num = (distance // lap_length) + 1  # 現在の周回数
-    lap_distance = distance % lap_length    # 今の周の中での走行距離
+    lap_num = (distance // lap_length) + 1
+    lap_distance = distance % lap_length
 
     # マイルストーン定義
     milestones = [
@@ -186,7 +402,6 @@ def get_journey_html(lti):
         (71297, "🇨🇦 カナディアンロッキー"), (77746, "🇯🇵 知床"), (79037, "🏫 京都")
     ]
 
-    # 現在地と目的地の特定
     current_m = milestones[0][1]
     current_d_rel = milestones[0][0]
     next_m = milestones[1][1]
@@ -200,30 +415,29 @@ def get_journey_html(lti):
                 next_m = milestones[i+1][1]
                 next_d_rel = milestones[i+1][0]
             else:
-                # 京都(ゴール)に到達した瞬間、表示を1周目のゴールから2周目のスタートに切り替える
                 current_m = milestones[0][1]
                 current_d_rel = milestones[0][0]
                 next_m = milestones[1][1]
                 next_d_rel = milestones[1][0]
 
-    # ＝＝＝ 追加：目的地までの進捗率（パーセンテージ）を計算 ＝＝＝
     segment_length = next_d_rel - current_d_rel
     if segment_length > 0:
         progress_pct = ((lap_distance - current_d_rel) / segment_length) * 100
     else:
         progress_pct = 100
     
-    # 0〜100の範囲に収める
     progress_pct = max(0, min(100, progress_pct))
 
-    # 軌跡（煙）の生成（直近40件）
+    # 軌跡（煙）の生成（直近40回のあらゆるアクション）
     recent = all_history[-40:]
     trail = "".join(["🟢" if "自力" in str(x.get("result","")) or "正解" in str(x.get("result","")) else 
                      "🟡" if "一部" in str(x.get("result","")) or "見てわかった" in str(x.get("result","")) else 
                      "🔴" if x.get("result") else "⚪" for x in recent])
 
-# UI生成
+    # 修正: UIの「マーカー」表示を削除
     html = f"""<div style="background: linear-gradient(135deg, #f1f5f9 0%, #d0ddfb 100%); padding: 20px; border-radius: 12px; font-family: sans-serif; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border: 1px solid #cbd5e1;" translate="no"><div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; border-bottom: 1px solid rgba(0,0,0,0.1); padding-bottom: 12px;"><div style="font-size: 20px; font-weight: bold; letter-spacing: 1px; color: #1e293b; padding-top: 4px;">🌏 PRIME - WORLD HERITAGE - ({lap_num}周目)<br><br>問題を解いたり、まちがいを直したりすると、移動距離UP!</div><div style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;"><div style="font-size: 14px; background: #e2e8f0; padding: 4px 12px; border-radius: 20px; color: #334155; border: 1px solid #cbd5e1;">📚 演習: <b style="color: #0f172a;">{total_work}</b> 問 &nbsp;|&nbsp; 🔄 復習: <b style="color: #0f172a;">{total_review}</b> 問</div><div style="font-size: 13px; background: #e2e8f0; padding: 4px 12px; border-radius: 20px; color: #334155; border: 1px solid #cbd5e1;">✅: <b style="color: #0f172a;">{orig_green+rev_green}</b> &nbsp;|&nbsp; 🟨: <b style="color: #0f172a;">{orig_yellow+rev_yellow}</b> &nbsp;|&nbsp; 🟥: <b style="color: #0f172a;">{orig_red+rev_red}</b></div></div></div><div style="background: #ffffff; border-radius: 8px; padding: 16px; position: relative; overflow: hidden; border: 1px solid #e2e8f0; box-shadow: inset 0 2px 4px rgba(0,0,0,0.02);"><div style="font-size: 15px; margin-bottom: 6px; display: flex; justify-content: space-between;"><span style="color: #475569;">移動距離: <span style="font-size: 22px; font-weight: bold; color: #0f172a;">{distance:,} km</span></span><span style="font-size: 13px; align-self: flex-end; color: #64748b;">(次の目的地 <span style="color: #334155; font-weight: bold;">{next_m}</span> まであと <span style="color: #0f172a; font-weight: bold;">{next_d_rel - lap_distance:,} km</span>)</span></div><div style="padding: 0 10px;"><div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px;"><span style="color: #0f172a; font-weight: bold;">{current_m}</span><span style="color: #475569; font-weight: bold;">{next_m}</span></div><div style="position: relative; width: 100%; height: 36px;"><div style="position: absolute; left: 0; right: 0; top: 14px; height: 6px; background: #e2e8f0; border-radius: 3px;"></div><div style="position: absolute; left: 0; top: 14px; height: 6px; background: #3b82f6; border-radius: 3px; box-shadow: 0 0 8px rgba(59, 130, 246, 0.4); width: {progress_pct}%;"></div><div style="position: absolute; left: {progress_pct}%; top: -4px; font-size: 28px; transform: translateX(-50%); filter: drop-shadow(0 2px 4px rgba(0,0,0,0.2)); z-index: 10;">✈️</div></div></div></div></div>"""
+    if native:
+        html = '<p translate="no">' + _native_history_notice(history_truncated) + '</p>' + html
     return gr.update(value=html, visible=True)
 
 # genaiのapiを走らせる
@@ -241,6 +455,16 @@ def gpt_exection(model, query):
             ]
         )
         response = completion.choices[0].message.content
+    elif model in ["llm-jp-4-32b-a3b-thinking", "llm-jp-4-8b-instruct"]:
+        completion = get_llmjp_client().chat.completions.create(
+                    model=model,
+                    messages=[
+                        {
+                        "role": "user", "content": query
+                        }
+                    ]
+                )
+        response = completion.choices[0].message.content
     else:
         ans = get_genai_client().models.generate_content(
         model=model, contents = query
@@ -248,7 +472,15 @@ def gpt_exection(model, query):
         response = ans.text
     return response
 
+@_prime_mongo_budget
 def handle_answer(exercise, answer, save, user_id, session, contents_id, page, no, y_marker, r_marker, tags, markers, school, new_contents_id, new_page, new_no, description, user_answer, understanding, rating, difficulty, fluency, relevance, new_checkbox, lti, report_type, report_text):
+    lti = _prime_authorized_lti(lti)
+    if lti.get("lti_version") == "1.3":
+        user_id, school = lti["user_id"], lti["school_id"]
+        if contents_id == "ai_generated":
+            page = user_id
+        if new_contents_id == "ai_generated":
+            new_page = user_id
     report = {
         "report_type": report_type,
         "report_text": report_text
@@ -293,7 +525,13 @@ def handle_answer(exercise, answer, save, user_id, session, contents_id, page, n
     history_col.insert_one(history_doc)
     return
 
-def handle_exercise(prev_contentsid, prev_page, prev_no, save, no, quiz_text, standard_answer, user, exercise_creation_time, answer_creation_time, model, session, lti, prompt_exercise, prompt_answer,rubric=None, figure_explanation=""):
+def handle_exercise(prev_contentsid, prev_page, prev_no, save, no, quiz_text, standard_answer, user, exercise_creation_time, answer_creation_time, model, session, lti, prompt_exercise, prompt_answer, custom_prompt="", rubric=None, figure_explanation=""):
+    if lti.get("lti_version") == "1.3":
+        with timeout(QUERY_MS / 1000):
+            lti = _prime_authorized_lti(lti)
+        user = lti["user_id"]
+        if prev_contentsid == "ai_generated":
+            prev_page = user
     if save:
         title = gpt_exection("gpt-4.1-nano", "以下の問題に短いタイトルをつけてください。タイトルのみを出力してください。\n{}".format(quiz_text))
         # rubricがNoneなら空にする
@@ -319,6 +557,7 @@ def handle_exercise(prev_contentsid, prev_page, prev_no, save, no, quiz_text, st
             "creation_model": model,
             "prompt_exercise": prompt_exercise,
             "prompt_answer": prompt_answer,
+            "custom_prompt": custom_prompt,
             "previous_quiz": previous_quiz,
             "school_id": lti["school_id"],
             "course_id": lti["context_id"],
@@ -327,10 +566,162 @@ def handle_exercise(prev_contentsid, prev_page, prev_no, save, no, quiz_text, st
             "timestamp": datetime.now(JST),
             "show": True
         }
-        exercise_col.insert_one(new_entry)
+        if lti.get("lti_version") == "1.3":
+            with timeout(QUERY_MS / 1000):
+                exercise_col.insert_one(new_entry)
+        else:
+            exercise_col.insert_one(new_entry)
     return
 
+def generate_xapi_statement(user_id, operationname_raw, session, lti, value=None):
+    """
+    表の定義に基づき、xAPI形式のログフォーマットを生成する関数
+    """
+    if lti.get("lti_version") == "1.3":
+        user_id = lti["user_id"]
+    # 1. Gradioから渡される操作名を、表の operation_name にマッピングする
+    op_map = {
+        "StartedSession": "StartedSession",
+        "Traveled": "Traveled",
+        "SelectedContents": "SelectedContents",
+        "SelectedExercise": "SelectedQuestion",  # アプリ内ではSelectedExercise
+        "SelectedBtnFromMarker": "SelectedCondition",  # 条件選択（マーカー）
+        "SelectedBtnFromRubric": "SelectedCondition",  # 条件選択（ルーブリック）
+        "SelectedRubricStatus": "SelectedRubricStatus",
+        "SelectedMarkerInput": "SelectedMarkerInput",
+        "SelectedModel": "SelectedModel",
+        "SubmittedCheck": "SubmittedCheck",
+        "RevSubmittedCheck": "SubmittedCheck", # そのまま解くボタン
+        "CreatedQuestion": "CreatedQuestion",
+        "CreateDescription": "CreatedDescription",
+        "CreatedAnswer": "CreatedAnswer",
+        "InputStudentAnswer": "ChangedAnswer", # アプリ内ではInputStudentAnswer
+        "AnsweredExercise": "AnsweredQuestion", # アプリ内ではAnsweredExercise
+        "SelectedComprehensibility": "UpdatedReflection_Understanding",
+        "SelectedUsefulness": "UpdatedReflection_Rating",
+        "SelectedDifficulty": "UpdatedReflection_Difficulty",
+        "SelectedFluency": "UpdatedReflection_Fluency",
+        "SelectedRelevance": "UpdatedReflection_Relevance",
+        "SelectedNewRubricStatus": "UpdatedReflection_Rubricstatus",
+        "Reported": "Reported"
+    }
+    
+    op_name = op_map.get(operationname_raw, operationname_raw)
+    
+    # 2. 表のデータに基づくverb, contextマッピング
+    meta = {
+        "StartedSession": {"verb": "started", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/started", "c1": "PRIME", "c2": "Others", "c3": "StartedSession"},
+        "Traveled": {"verb": "progressed", "verb_id": "http://adlnet.gov/expapi/verbs/progressed", "c1": "PRIME", "c2": "Others", "c3": "Traveled"},
+        "SelectedContents": {"verb": "selected", "verb_id": "https://w3id.org/xapi/adb/verbs/selected", "c1": "PRIME", "c2": "Select", "c3": "SelectedContents"},
+        "SelectedQuestion": {"verb": "selected", "verb_id": "https://w3id.org/xapi/adb/verbs/selected", "c1": "PRIME", "c2": "Select", "c3": "SelectedQuestion"},
+        "SelectedCondition": {"verb": "selected", "verb_id": "https://w3id.org/xapi/adb/verbs/selected", "c1": "PRIME", "c2": "Assess", "c3": "SelectedCondition"},
+        "SelectedRubricStatus": {"verb": "selected", "verb_id": "https://w3id.org/xapi/adb/verbs/selected", "c1": "PRIME", "c2": "Assess", "c3": "SelectedRubricStatus"},
+        "SelectedMarkerInput": {"verb": "selected", "verb_id": "https://w3id.org/xapi/adb/verbs/selected", "c1": "PRIME", "c2": "Assess", "c3": "SelectedMarkerInput"},
+        "SelectedModel": {"verb": "selected", "verb_id": "https://w3id.org/xapi/adb/verbs/selected", "c1": "PRIME", "c2": "Others", "c3": "SelectedModel"},
+        "SubmittedCheck": {"verb": "submitted", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/submitted", "c1": "PRIME", "c2": "Create", "c3": "SubmittedCheck"},
+        "CreatedQuestion": {"verb": "viewed", "verb_id": "http://id.tincanapi.com/verb/viewed", "c1": "PRIME", "c2": "Create", "c3": "CreatedQuestion"},
+        "CreatedDescription": {"verb": "enabled", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/enabled", "c1": "PRIME", "c2": "Create", "c3": "CreatedDescription"},
+        "CreatedAnswer": {"verb": "enabled", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/enabled", "c1": "PRIME", "c2": "Create", "c3": "CreatedAnswer"},
+        "ChangedAnswer": {"verb": "updated", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/updated", "c1": "PRIME", "c2": "Work", "c3": "ChangedAnswer"},
+        "AnsweredQuestion": {"verb": "attempted", "verb_id": "http://adlnet.gov/expapi/verbs/attempted", "c1": "PRIME", "c2": "Check", "c3": "AnsweredQuestion"},
+        "UpdatedReflection_Understanding": {"verb": "updated", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/updated", "c1": "PRIME", "c2": "Reflect", "c3": "UpdatedReflection_Understanding"},
+        "UpdatedReflection_Rating": {"verb": "updated", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/updated", "c1": "PRIME", "c2": "Reflect", "c3": "UpdatedReflection_Rating"},
+        "UpdatedReflection_Difficulty": {"verb": "updated", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/updated", "c1": "PRIME", "c2": "Reflect", "c3": "UpdatedReflection_Difficulty"},
+        "UpdatedReflection_Fluency": {"verb": "updated", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/updated", "c1": "PRIME", "c2": "Reflect", "c3": "UpdatedReflection_Fluency"},
+        "UpdatedReflection_Relevance": {"verb": "updated", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/updated", "c1": "PRIME", "c2": "Reflect", "c3": "UpdatedReflection_Relevance"},
+        "UpdatedReflection_Rubricstatus": {"verb": "updated", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/updated", "c1": "PRIME", "c2": "Reflect", "c3": "UpdatedReflection_Rubricstatus"},
+        "Reported": {"verb": "submitted", "verb_id": "https://w3id.org/xapi/dod-isd/verbs/submitted", "c1": "PRIME", "c2": "Others", "c3": "Reported"}
+    }
+    
+    op_info = meta.get(op_name)
+    if not op_info:
+        # 表に記載のない処理の場合は記録しない
+        return {}
+
+    # 3. extensions の中身を構築
+    ext_data = {
+        'session_id': str(session)
+    }
+    
+    # 引数 value に入ってくる値（Gradioのステート）に応じた振り分け
+    if value is not None:
+        if op_name == "SelectedContents":
+            ext_data['contents_name'] = str(value)
+        elif op_name == "SelectedQuestion":
+            ext_data['quiz_title'] = str(value)
+        elif op_name == "SelectedModel":
+            ext_data['model'] = str(value)
+        elif op_name in ["SelectedRubricStatus", "UpdatedReflection_Rubricstatus"]:
+            ext_data['rubrics'] = value
+        elif op_name == "SelectedMarkerInput":
+            ext_data['marker'] = value
+        elif op_name == "ChangedAnswer":
+            ext_data['student_answer'] = str(value)
+        elif "UpdatedReflection_" in op_name:
+            cat = op_name.split("_")[1]
+            ext_data['categories'] = cat
+            ext_data['value'] = str(value)
+        else:
+            ext_data['raw_value'] = value
+
+    # operationname_raw 固有の例外処理（マーカーで作る/解答のポイントで作る のボタン判別）
+    if operationname_raw == "SelectedBtnFromMarker":
+        ext_data['value'] = {'marker': 'True', 'rubric': 'False'}
+    elif operationname_raw == "SelectedBtnFromRubric":
+        ext_data['value'] = {'marker': 'False', 'rubric': 'True'}
+    elif operationname_raw == "RevSubmittedCheck":
+        ext_data['review_type'] = 'reviewing'
+    elif operationname_raw == "SubmittedCheck":
+        ext_data['review_type'] = 'creating'
+
+    # 4. xAPIステートメントの組み立て
+    xapi_statement = {
+        "actor": {
+            "account": {
+                "homePage": "https://prime.example.com", # 固定値
+                "name": str(user_id)
+            }
+        },
+        "verb": {
+            "id": op_info["verb_id"],
+            "display": {
+                "en-US": op_info["verb"]
+            }
+        },
+        "object": {
+            "id": f"https://w3id.org/xapi/PRIME/activities/{op_name}",
+            "definition": {
+                "name": {
+                    "en-US": "PRIME"
+                },
+                "description": {
+                    "en-US": "数学問題生成機能"
+                },
+                "extensions": {
+                    "https://w3id.org/xapi/PRIME/extension": ext_data
+                }
+            }
+        },
+        "context": {
+            "contextActivities": {
+                "category": [
+                    {"id": f"https://w3id.org/xapi/PRIME/context/{op_info['c1']}"},
+                    {"id": f"https://w3id.org/xapi/PRIME/context/{op_info['c2']}"},
+                    {"id": f"https://w3id.org/xapi/PRIME/context/{op_info['c3']}"}
+                ]
+            }
+        },
+        "timestamp": datetime.now(JST).isoformat()
+    }
+    
+    return xapi_statement
+
+@_prime_mongo_budget
 def handle_logs(user_id, operationname, session, lti, value=None):
+    lti = _prime_authorized_lti(lti)
+    if lti.get("lti_version") == "1.3":
+        user_id = lti["user_id"]
+    # 1. 既存のログ保存
     logs_col.insert_one({
         "school_id": lti["school_id"],
         "course_id": lti["context_id"],
@@ -341,6 +732,15 @@ def handle_logs(user_id, operationname, session, lti, value=None):
         "operationname": operationname,
         "value": value
     })
+    
+    # 2. xAPI形式のログ生成と保存
+    xapi_data = generate_xapi_statement(user_id, operationname, session, lti, value)
+    
+    # 中身が実装（定義）されたらDBに書き込む処理
+    # （空の辞書 {} をそのままMongoDBに保存すると不要な空データが増えるため、キーが存在するかで判定しています）
+    if xapi_data:
+        xapi_col.insert_one(xapi_data)
+        
     return
 
 #学年を特定する
@@ -352,47 +752,45 @@ def find_grade(context):
     return "中学3年"
 
 # ✅ MongoDBから再読み込みして State と Dropdown を更新する関数
+@_prime_mongo_budget
 def reload_quiz_map_from_mongo(lti, target_contents_id):
-    print("\n" + "="*50)
-    print(f" [DEBUG START] reload_quiz_map_from_mongo")
-    print(f"  - school_id: {lti.get('school_id')}")
-    print(f"  - context_id: {lti.get('context_id')}")
-    print(f"  - user_id: {lti.get('user_id')}")
-    print(f"  - target_contents_id: {target_contents_id}")
-    print("="*50)
+    native = lti.get("lti_version") == "1.3"
+    debug = (lambda *args: None) if native else print
+    debug("\n" + "="*50)
+    debug(" [DEBUG START] reload_quiz_map_from_mongo")
+    debug(f"  - target_contents_id: {target_contents_id}")
+    debug("="*50)
 
     # 1. MongoDB (exercise_col) から問題一覧を取得
-    documents = list(
-        exercise_col.find({
-            "school_id": lti["school_id"],
-            "$and": [  
-                {
-                    "$or": [
-                        {"course_id": lti["context_id"]},
-                        {"course_id": "prime"}
-                    ]
-                },
-                {
-                    "$or": [
-                        {"user": lti["user_id"]},
-                        {"user": "prime"}
-                    ]
-                },
-                {
-                    "$or": [
-                        {"contents_id": target_contents_id},
-                        {"previous_quiz.contents_id": target_contents_id}
-                    ]
-                }
+    questions_truncated = history_truncated = False
+    if native:
+        scope = _prime_lti_scope(lti)
+        store = PrimeStore(quiz_generator_db)
+        store.authorize(scope)
+        documents, questions_truncated = store.native_question_window(scope, target_contents_id)
+        reports, history_truncated = store.native_report_window(scope)
+        history_docs = [doc for _, doc in reversed(reports)]
+    else:
+        query = {
+            "school_id": lti["school_id"], "show": True,
+            "$and": [
+                {"course_id": {"$in": [lti["context_id"], "prime"]}},
+                {"user": {"$in": [lti["user_id"], "prime"]}},
+                {"$or": [{"contents_id": target_contents_id},
+                         {"previous_quiz.contents_id": target_contents_id}]},
             ],
-            "show": True
-        })
-    )
+        }
+        documents = list(exercise_col.find(query))
 
-    print(f"[STEP 1] exercise_col find完了: {len(documents)}件ヒット")
+    debug(f"[STEP 1] exercise_col find完了: {len(documents)}件ヒット")
 
     if not documents:
-        print(" [RESULT] ドキュメントが0件のため、空のデータを返します。")
+        debug(" [RESULT] ドキュメントが0件のため、空のデータを返します。")
+        if native:
+            notice = _native_history_notice(history_truncated)
+            if questions_truncated:
+                notice += f" 問題一覧は最大{QUESTION_SCAN_LIMIT}件の限定表示です。問題または長い本文が省略されています。"
+            return {}, gr.update(choices=[], value=None), gr.update(value=notice, visible=True)
         return {}, gr.update(choices=[], value=None)
 
     user_id = lti["user_id"]
@@ -400,23 +798,17 @@ def reload_quiz_map_from_mongo(lti, target_contents_id):
 
     # --- 1. ClickHouseから元の問題の解答履歴を取得 ---
     ch_status_map = {}
-    target_key = os.getenv("LTI_CONSUMER_KEY_1")
-    
-    print(f"[STEP 2] ClickHouse取得開始 (School ID: {school_id})")
-    if school_id == target_key:
+    debug("[STEP 2] ClickHouse取得開始")
+    clickhouse_client, db_name = (None, None) if native else get_clickhouse_client_and_db(school_id)
+    if clickhouse_client and db_name:
         try:
-            clickhouse_client = clickhouse_connect.get_client(
-                host=os.getenv("BOOKROLL_DATABASE_HOST_1"), 
-                username=os.getenv("BOOKROLL_DATABASE_USER_1"), 
-                password=os.getenv("BOOKROLL_DATABASE_PASS_1")
-            )
-            sql = """
+            sql = f"""
             SELECT 
                 page_no, 
                 argMax(CAST(results_response AS String), timestamp) AS latest_response
-            FROM saikyo_new.statements_target
-            WHERE actor_name_id = {user:String}
-              AND contents_id = {contents_id:String}
+            FROM {db_name}.statements_target
+            WHERE actor_name_id = {{user:String}}
+              AND contents_id = {{contents_id:String}}
               AND operation_name = 'ANSWER_QUIZ'
             GROUP BY page_no
             """
@@ -447,16 +839,16 @@ def reload_quiz_map_from_mongo(lti, target_contents_id):
                 
                 ch_status_map[page_no] = status
             
-            print(f" - ClickHouse結果: {len(ch_status_map)}件のページ履歴を取得")
-            print(f" - ch_status_map: {ch_status_map}")
+            debug(f" - ClickHouse結果: {len(ch_status_map)}件のページ履歴を取得")
+            debug(f" - ch_status_map: {ch_status_map}")
 
         except Exception as e:
-            print(f" [ERROR] ClickHouse取得中に例外発生: {e}")
+            debug(f" [ERROR] ClickHouse取得中に例外発生: {e}")
     else:
-        print(f" - ClickHouseスキップ: school_id が一致しません (expected: {target_key})")
+        debug(" - ClickHouseスキップ: 設定なし")
 
     # --- 2. MongoDB(history_col)から解答履歴を取得 ---
-    print(f"[STEP 3] history_col 検索ターゲット作成")
+    debug(f"[STEP 3] history_col 検索ターゲット作成")
     mongo_status_map = {}
     search_targets = []
     for doc in documents:
@@ -471,15 +863,13 @@ def reload_quiz_map_from_mongo(lti, target_contents_id):
             })
             
     search_targets.append({"contents_id": target_contents_id})
-    print(f" - 検索ターゲット数: {len(search_targets)}")
+    debug(f" - 検索ターゲット数: {len(search_targets)}")
 
-    history_docs = list(history_col.find({
-        "school_id": school_id,
-        "user": user_id,
-        "$or": search_targets
-    }).sort("timestamp", 1)) 
+    if not native:
+        history_query = {"school_id": school_id, "user": user_id, "$or": search_targets}
+        history_docs = list(history_col.find(history_query).sort("timestamp", 1))
     
-    print(f" - history_col 取得件数: {len(history_docs)}件")
+    debug(f" - history_col 取得件数: {len(history_docs)}件")
 
     for h in history_docs:
         h_contents_id = h.get("contents_id")
@@ -504,8 +894,8 @@ def reload_quiz_map_from_mongo(lti, target_contents_id):
             key = f"{h_contents_id}_{h_page}_{h_no}"
             mongo_status_map[key] = emoji
 
-    print(f" - mongo_status_mapを構築完了 (件数: {len(mongo_status_map)})")
-    print(f" - mongo_status_map: {mongo_status_map}")
+    debug(f" - mongo_status_mapを構築完了 (件数: {len(mongo_status_map)})")
+    debug(f" - mongo_status_map: {mongo_status_map}")
 
     def shorten_sessionid(sessionid, n=5):
         if not sessionid: return "unknown"
@@ -514,23 +904,23 @@ def reload_quiz_map_from_mongo(lti, target_contents_id):
             s = base64.urlsafe_b64encode(sessionid_obj.bytes)
             return s.decode('ascii').rstrip('=')[:n]
         except Exception as e:
-            print(f" [DEBUG] session_idの短縮に失敗: {e}")
+            debug(f" [DEBUG] session_idの短縮に失敗: {e}")
             return "err"
     
     # --- 3. クイステキスト辞書の構築 ---
-    print(f"[STEP 4] 選択肢タイトルの構築と絵文字判定開始")
+    debug(f"[STEP 4] 選択肢タイトルの構築と絵文字判定開始")
     quiz_text_dict = {}
 
     for doc in documents:
         text = doc.get("quiz_text")
         contents_id = doc.get("contents_id")
-        page = str(doc.get("page"))
+        page = lti["user_id"] if native and contents_id == "ai_generated" else str(doc.get("page"))
         no = str(doc.get("no"))
         ans = doc.get("answer_id", "")
         ans_page_s = doc.get("answer_page_start", "")
         ans_page_e = doc.get("answer_page_end", "")
-        title = doc.get("quiz_title")
-        school = doc.get("school_id")
+        title = doc.get("quiz_title") or ""
+        school = scope.school_id if native else doc.get("school_id")
         
         # 履歴に基づいて絵文字を決定
         prefix = "⬜ " 
@@ -550,12 +940,20 @@ def reload_quiz_map_from_mongo(lti, target_contents_id):
                 match_source = f"ClickHouse(Page:{page})"
 
         # 判定結果を1つずつ出力
-        print(f"  [Judge] Title: {title[:15]}... | Key: {contents_id}/{page}/{no} | Prefix: {prefix} | Source: {match_source}")
+        debug(f"  [Judge] Title: {title[:15]}... | Key: {contents_id}/{page}/{no} | Prefix: {prefix} | Source: {match_source}")
 
         if contents_id == "ai_generated":
-            sid = doc.get("session_id")
-            session_short = shorten_sessionid(sid)
-            display_title = prefix + "類題" + f"{int(no):04d}: " + title + " (問題ID:{})".format(session_short)
+            session_short = "" if native else shorten_sessionid(doc.get("session_id"))
+            
+            # ▼追加：数字に変換できる時だけ4桁(0001等)にし、そうでない場合はそのまま表示する安全な処理
+            try:
+                formatted_no = f"{len(quiz_text_dict) + 1:04d}" if native else f"{int(no):04d}"
+            except (ValueError, TypeError):
+                formatted_no = str(no)
+                
+            display_title = prefix + "類題" + f"{formatted_no}: " + title
+            if not native:
+                display_title += f" (問題ID:{session_short})"
         else:
             display_title = prefix + title
         
@@ -563,11 +961,18 @@ def reload_quiz_map_from_mongo(lti, target_contents_id):
             quiz_text_dict[display_title] = (text, contents_id, page, no, school, ans, ans_page_s, ans_page_e)
 
     # --- 4. ソート ---
-    print(f"[STEP 5] ソート処理開始")
+    debug(f"[STEP 5] ソート処理開始")
     sorted_choices = sorted(
         quiz_text_dict.keys(),
         key=lambda k: k[2:] if k.startswith(('✅', '🟨', '🟥', '⬜')) else k
     )
+    if native:
+        notice = _native_history_notice(history_truncated)
+        notice += f" 問題一覧は最大{QUESTION_SCAN_LIMIT}件です。⬜はこの最近の記録内に解答がない問題で、未学習の判定ではありません。"
+        if questions_truncated:
+            notice += " 問題または長い本文が省略されています。"
+        print("Native scoped question window loaded.")
+        return quiz_text_dict, gr.update(choices=sorted_choices, value=None, visible=True), gr.update(value=notice, visible=True)
 
     # ＝＝＝ 修正：演習（もとの問題）のみをカウントするように絞り込み ＝＝＝
     # quiz_text_dict[c][1] は contents_id を指します。これが "ai_generated" でないものだけを抽出
@@ -625,13 +1030,25 @@ def reload_quiz_map_from_mongo(lti, target_contents_id):
     # ▲▲▲ 追加ここまで ▲▲▲
     summary_update = ""
 
-    print(f" - ソート済み選択肢（先頭5件）: {sorted_choices[:5]}")
-    print(f" [DEBUG END] reload_quiz_map_from_mongo 正常終了")
-    print("="*50 + "\n")
+    debug(f" - ソート済み選択肢（先頭5件）: {sorted_choices[:5]}")
+    debug(f" [DEBUG END] reload_quiz_map_from_mongo 正常終了")
+    debug("="*50 + "\n")
 
     return quiz_text_dict, gr.update(choices=sorted_choices, value=None, visible=True), summary_update
 
+@_prime_mongo_budget
 def get_contents_dict_from_clickhouse(lti):
+    if lti.get("lti_version") == "1.3":
+        result = PrimeStore(quiz_generator_db).list_prime_materials(_prime_lti_scope(lti))
+        contents_dict = {
+            f"{material['title']} (ID: {material['material_id']})": {
+                "contents_id": material["material_id"], "contents_name": material["title"],
+            }
+            for material in result["materials"]
+        }
+        if result["truncated"]:
+            gr.Info("教材一覧は件数上限のある限定表示です。一部の教材は省略されています。")
+        return contents_dict, gr.update(choices=sorted(contents_dict), value=None)
     # 1. MongoDBから該当の lti["context_id"] が course_id に含まれるものを検索
     query = {"course_id": lti["context_id"]}
     projection = {"contents_id": 1, "_id": 0}
@@ -650,20 +1067,19 @@ def get_contents_dict_from_clickhouse(lti):
         return contents_dict
 
     # 2. ClickHouseに接続
-    clickhouse_client = clickhouse_connect.get_client(
-        host=os.getenv("BOOKROLL_DATABASE_HOST_1"), 
-        username=os.getenv("BOOKROLL_DATABASE_USER_1"), 
-        password=os.getenv("BOOKROLL_DATABASE_PASS_1")
-    )
+    school_id = str(lti["school_id"])
+    clickhouse_client, db_name = get_clickhouse_client_and_db(school_id)
+    
+    if not clickhouse_client or not db_name:
+        return contents_dict, gr.update(choices=[], value=None)
 
     # 3. それぞれの contents_id に対してClickHouseから contents_name を取得
     for c_id in contents_ids:
-        # LIMIT 1 で一番上の1行だけを取得するように最適化
-        sql = """
+        sql = f"""
         SELECT contents_name 
-        FROM saikyo_new.statements_mv 
+        FROM {db_name}.statements_mv 
         WHERE operation_name = 'REGISTER_CONTENTS' 
-        AND contents_id = {contents_id:String}
+        AND contents_id = {{contents_id:String}}
         ORDER BY timestamp DESC
         LIMIT 1
         """
@@ -704,7 +1120,38 @@ phrases = [
 ]
 
 # userのこれまでのresultを入手する
+@_prime_mongo_budget
 def get_result_from_db(school, contents_id, page, no, user, lti, answer_contents_id, answer_page_start, answer_page_end):
+    if lti.get("lti_version") == "1.3":
+        scope = _prime_lti_scope(lti)
+        store = PrimeStore(quiz_generator_db)
+        store.authorize(scope)
+        if contents_id == "ai_generated" and page != scope.learner_id:
+            raise gr.Error("The selected question is no longer available.")
+        reports, truncated = store.native_report_window(scope)
+        gr.Info(_native_history_notice(truncated))
+        working = reviews = 0
+        history = []
+        for _, document in reversed(reports):
+            direct = (document.get("contents_id") == contents_id
+                      and str(document.get("page")) == str(page)
+                      and str(document.get("no")) == str(no))
+            previous = document.get("previous_quiz")
+            related = (contents_id != "ai_generated" and isinstance(previous, dict)
+                       and previous.get("school_id") == scope.school_id
+                       and previous.get("contents_id") == contents_id
+                       and str(previous.get("page")) == str(page)
+                       and str(previous.get("no")) == str(no))
+            if direct:
+                working += 1
+            elif related:
+                reviews += 1
+            else:
+                continue
+            history.append({"type": "review" if contents_id == "ai_generated" or related else "original",
+                            "result": document.get("understanding", "")})
+        latest = history[-1]["result"] if history else ""
+        return working, reviews, "", "", history, {}, latest
     
     num_workingquiz = 0
     num_reviewquiz = 0
@@ -743,22 +1190,18 @@ def get_result_from_db(school, contents_id, page, no, user, lti, answer_contents
         # --- もとの問題が選ばれた場合 ---
         class_stats = {"green": [], "yellow": [], "red": []}
 
-        if lti["school_id"] == os.getenv("LTI_CONSUMER_KEY_1"):
+        clickhouse_client, db_name = get_clickhouse_client_and_db(lti["school_id"])
+        
+        if clickhouse_client and db_name:
             try:
-                clickhouse_client = clickhouse_connect.get_client(
-                    host=os.getenv("BOOKROLL_DATABASE_HOST_1"), 
-                    username=os.getenv("BOOKROLL_DATABASE_USER_1"), 
-                    password=os.getenv("BOOKROLL_DATABASE_PASS_1")
-                )
-
                 # B. 個人の元の問題の解答履歴
-                sql_user_history = """
+                sql_user_history = f"""
                 SELECT CAST(results_response AS String), timestamp
-                FROM saikyo_new.statements_target
+                FROM {db_name}.statements_target
                 WHERE operation_name='ANSWER_QUIZ'
-                  AND actor_name_id={user:String}
-                  AND contents_id={contents_id:String}
-                  AND page_no={page:String}
+                  AND actor_name_id={{user:String}}
+                  AND contents_id={{contents_id:String}}
+                  AND page_no={{page:String}}
                 ORDER BY timestamp ASC
                 """
                 params_user = {
@@ -775,19 +1218,19 @@ def get_result_from_db(school, contents_id, page, no, user, lti, answer_contents
                     num_workingquiz += 1
 
                 # C. クラス全体のもとの問題の正答率
-                sql_class_stats = """
+                sql_class_stats = f"""
                 SELECT actor_name_id, argMax(CAST(results_response AS String), timestamp)
-                FROM saikyo_new.statements_target
+                FROM {db_name}.statements_target
                 WHERE operation_name='ANSWER_QUIZ'
-                  AND contents_id={contents_id:String}
-                  AND page_no={page:String}
-                  AND context_id={course_id:String}  -- ✨追加: クラス(コース)で絞り込み
+                  AND contents_id={{contents_id:String}}
+                  AND page_no={{page:String}}
+                  AND context_id={{course_id:String}}
                 GROUP BY actor_name_id
                 """
                 params_class = {
                     "contents_id": str(contents_id), 
                     "page": str(page),
-                    "course_id": str(lti["context_id"]) # ✨追加
+                    "course_id": str(lti["context_id"])
                 }
                 res_class = clickhouse_client.query(sql_class_stats, params_class)
                 
@@ -798,7 +1241,7 @@ def get_result_from_db(school, contents_id, page, no, user, lti, answer_contents
 
                 # マーカー取得
                 if answer_contents_id != "" and str(answer_page_start).isdigit() and str(answer_page_end).isdigit():
-                    sql2 = """
+                    sql2 = f"""
                     SELECT
                         last_text AS marker_text,
                         last_color AS marker_color
@@ -810,16 +1253,16 @@ def get_result_from_db(school, contents_id, page, no, user, lti, answer_contents
                             argMax(CAST(marker_color AS String), timestamp) AS last_color,
                             argMax(CAST(page_no AS Int32), timestamp) AS last_page
                         FROM
-                            saikyo_new.statements_target
+                            {db_name}.statements_target
                         WHERE
-                            actor_name_id = {user:String}
-                            AND contents_id = {answer_contents_id:String}
+                            actor_name_id = {{user:String}}
+                            AND contents_id = {{answer_contents_id:String}}
                         GROUP BY
                             marker_position
                     )
                     WHERE
                         last_op = 'ADD_MARKER'
-                        AND last_page BETWEEN {answer_page_start:Integer} AND {answer_page_end:Integer}                        
+                        AND last_page BETWEEN {{answer_page_start:Integer}} AND {{answer_page_end:Integer}}                        
                     """
                     params2 = {
                         "user": str(user), 
@@ -992,7 +1435,7 @@ def check_if_solvable(question, knowledge, num, model, grade):
     elapsed_time_solve = end_time - start_time
     return ans, prompt, f"{elapsed_time_solve:.2f}"
 
-def execute0006_ks(question, answer, knowledge, tags, model, quiz_base, grade, yellow_marker, red_marker):
+def execute0006_ks(question, answer, knowledge, tags, model, quiz_base, grade, yellow_marker, red_marker, custom_prompt=""):
     start_time = time.time()
     reason = ["この問題についてはよくできています。さらに知識を応用した問題で復習しましょう！\n",
           "最後の最後でミスをしています。最後まで気を抜かずに、しっかり解き切りましょう！\n",
@@ -1098,6 +1541,39 @@ def execute0006_ks(question, answer, knowledge, tags, model, quiz_base, grade, y
     $$ \\begin{}{}{} XXXX \\end{}{} $$
     '''.format(grade, r"{a}", r"{b}", r"text{の値から、}", r"text{を求める}", "{array", "}{l", "}", "{array", "}")
 
+    if custom_prompt:
+        # 1. 判定用のプロンプトを作成
+        check_prompt = f"""
+        以下の「生徒からの追加要望」は、数学の復習問題を自動生成するシステムへの指示です。
+        この要望を満たすためには、システムが「もとの問題文」の内容や設定（場面、登場人物、具体的な状況など）を直接知っている必要がありますか？
+
+        （判断基準の例）
+        - 「もとの問題と同じ形式で」「数値を変更して」「少し難しくして」など、元の問題がベースとなるニュアンスがあれば「True」
+        - 「英語で出して」「図形の問題にして」「全く別の設定にして」など、元の設定に依存しないものは「False」
+
+        必要な場合は「True」、不要な場合は「False」のみを出力してください。
+
+        生徒からの追加要望:
+        {custom_prompt}
+        """
+        needs_original = False
+        try:
+            # 2. 高速なモデルで判定を実行
+            check_result = gpt_exection("gpt-4.1-nano", check_prompt)
+            if "True" in check_result or "true" in check_result.lower():
+                needs_original = True
+        except Exception as e:
+            print(f"Original question context check failed: {e}")
+            # エラー時は念のため含めない方向にする
+            pass
+
+        # 3. 判定結果に応じて指示を組み立てる
+        custom_instruction = f"- 生徒からの追加要望（必ず考慮し、要望に沿った内容にすること）: {custom_prompt}\n"
+        if needs_original:
+            custom_instruction += f"- ※追加要望を満たすために、以下の【もとの問題】の設定や形式を参照して問題を作成してください。\n【もとの問題】\n{question}\n"
+            
+        condition = custom_instruction + "\n" + condition
+
     prompt = base1 + prompt_main + condition
 
     
@@ -1108,9 +1584,9 @@ def execute0006_ks(question, answer, knowledge, tags, model, quiz_base, grade, y
     return description, ans, f"{elapsed_time_creation:.2f}", prompt
 
 # rubricの説明を抽出する関数
-def get_main_explanations(quiz_title, quiz_text_dict):
+def get_main_explanations(quiz_title, quiz_text_dict, lti):
     quiz_text, contents_id, page, no, school, ans, ans_page_s, ans_page_e = quiz_text_dict[quiz_title]
-    exercise_info = exercise_col.find_one({"school_id": school, "contents_id": contents_id, "page": page, "no": no})
+    exercise_info = _scoped_exercise_info(lti, {"school_id": school, "contents_id": contents_id, "page": page, "no": no})
     rubrics = exercise_info.get("rubric", {})
     main_list = [item["main"] for item in rubrics.values() if "main" in item]
     if (len(main_list) > 0) and ("上記の項目について、ひとつも理解できなかった" not in main_list):
@@ -1121,19 +1597,45 @@ def initial_register():
     #quiz.json読み込み
     quiz_path = os.path.join(os.path.dirname(__file__), "static", "quiz.json")
 
+    if not os.path.exists(quiz_path):
+        return
+
     with open(quiz_path, encoding="utf-8") as f:
         quiz_list = json.load(f)
 
+    if not quiz_list:
+        return
+
+    # 一括保存用のリストを作成
+    requests = []
     for quiz in quiz_list:
         contents_id = quiz["contents_id"]
         page = quiz["page"]
         no = quiz["no"]
         school = quiz["school_id"]
         user = quiz["user"]
-        # 追加または置き換え
-        exercise_col.replace_one({"contents_id": contents_id, "page": page, "no": no, "school_id": school, "user": user}, quiz, upsert=True)
+        
+        # 1件ずつ通信せず、リクエストとしてリストにためる
+        requests.append(
+            ReplaceOne(
+                {"contents_id": contents_id, "page": page, "no": no, "school_id": school, "user": user}, 
+                quiz, 
+                upsert=True
+            )
+        )
+    
+    # リストにデータがあれば、1回の通信で一括更新 (めちゃくちゃ早くなります)
+    if requests:
+        try:
+            exercise_col.bulk_write(requests)
+            print(f"Quiz JSON loaded successfully: {len(requests)} items.")
+        except Exception as e:
+            print(f"Quiz JSON load failed: {e}")
 
     return
+
+# ▼ 追加：Gradioの画面ロード時ではなく、サーバー(アプリ)起動時に1回だけ実行させる
+initial_register()
 
 with gr.Blocks() as demo:
     lti_state = gr.State()  # ここにユーザー情報を保存   
@@ -1156,6 +1658,9 @@ with gr.Blocks() as demo:
     overall_creation_time_state = gr.State()
     prompt_exercise_state = gr.State("")
     prompt_answer_state = gr.State("")
+    custom_prompt_state = gr.State("")
+    can_use_custom_prompt_state = gr.State(False)
+    user_answer_state = gr.State("")
     new_contentsid_state = gr.State()
     new_page_state = gr.State()
     new_no_state = gr.State()
@@ -1249,12 +1754,19 @@ with gr.Blocks() as demo:
                 show_label = False
             )
 
+            custom_prompt_input = gr.Textbox(
+                label="問題生成への追加要望（オプション）",
+                placeholder="例：もっと難しい問題にしてほしい、文章題にしてほしい など",
+                visible=False,
+                interactive=True
+            )
+
             model_options = gr.Dropdown(
-            choices=["o4-mini(速さ重視、普段使いにおすすめ)", "gemini-2.5-flash(そこそこの速さ、解答が細かい)", "gpt-5(正確さ重視・遅い。より深い学習向け)"],
-            label="復習問題を作成するモデルを選んでください",
-            interactive=True,
-            value="o4-mini(速さ重視、普段使いにおすすめ)",
-            visible=False
+                choices=["o4-mini(速さ重視、普段使いにおすすめ)", "gpt-5(正確さ重視・遅い。より深い学習向け)", "llm-jp-4(日本製のモデル)"],
+                label="復習問題を作成するモデルを選んでください",
+                interactive=True,
+                value="o4-mini(速さ重視、普段使いにおすすめ)",
+                visible=False
             )
     quiz_dropdown_state = gr.State()
     status_msg_state = gr.State()
@@ -1268,6 +1780,7 @@ with gr.Blocks() as demo:
     cnt_work_state = gr.State()
     cnt_review_state = gr.State()
     model_state = gr.State("o4-mini")
+    can_use_custom_prompt_state = gr.State(False)
     description_state = gr.State()
     
     with gr.Row(elem_classes="notranslate"):  
@@ -1503,12 +2016,13 @@ with gr.Blocks() as demo:
         outputs=None
     )
 
+    @_prime_mongo_budget
     def update_when_dropdown(quiz_title, quiz_text_dict, user, lti):
         if quiz_title:
             quiz_text, contents_id, page, no, school, ans, ans_page_s, ans_page_e = quiz_text_dict[quiz_title]
-            rubric_explanations = get_main_explanations(quiz_title, quiz_text_dict)
+            rubric_explanations = get_main_explanations(quiz_title, quiz_text_dict, lti)
             
-            exercise_info = exercise_col.find_one({"school_id": school, "contents_id": contents_id, "page": page, "no": no})
+            exercise_info = _scoped_exercise_info(lti, {"school_id": school, "contents_id": contents_id, "page": page, "no": no})
             isfigure = exercise_info.get("isfigure", False) if exercise_info else False
             
             if isfigure:
@@ -1546,6 +2060,8 @@ with gr.Blocks() as demo:
                 user_latest_result=user_latest_result,
                 user_id=user
             )
+            if lti.get("lti_version") == "1.3":
+                msg = '<p translate="no">' + _native_history_notice(False) + '</p>' + msg
             
             rubric_label = "できたポイントをチェックしよう！" if isrubric else "この問題には解答のポイントがついていません"
             marker_label = "類題に反映したいマーカーの種類を選ぼう" if ishighlighted else "BookRollにマーカーを引いてみよう！"
@@ -1569,8 +2085,9 @@ with gr.Blocks() as demo:
             else:
                 update_rubric_btn = gr.update(visible=True, interactive=False, variant="secondary", value="解答のポイントからつくる")
 
-            # --- 5. 画面UIの更新（西京高校向けの条件分岐） ---
-            if lti["school_id"] == "C126210001533":
+            can_custom = (count_review > 0) and (lti["school_id"] != "C126210001533")
+
+            if lti["school_id"] != "F126110107407":
                 # 元の問題を１回も解いていない場合
                 if count_work == 0:
                     return (
@@ -1595,7 +2112,9 @@ with gr.Blocks() as demo:
                         update_marker_btn, # btn_from_marker
                         update_rubric_btn, # btn_from_rubric
                         False, # marker_btn_state
-                        False  # rubric_btn_state
+                        False, # rubric_btn_state
+                        can_custom,
+                        gr.update(visible=False, value="")
                     )
                 # 元の問題を１回は解いているが、復習問題を１回も解いていない場合
                 elif count_review == 0:
@@ -1621,7 +2140,9 @@ with gr.Blocks() as demo:
                         update_marker_btn, # btn_from_marker
                         update_rubric_btn, # btn_from_rubric
                         False, # marker_btn_state
-                        False  # rubric_btn_state
+                        False, # rubric_btn_state
+                        can_custom,
+                        gr.update(visible=False, value="")
                     )
                 # それ以外（１回以上復習済み）
                 else:
@@ -1647,10 +2168,11 @@ with gr.Blocks() as demo:
                         update_marker_btn, # btn_from_marker
                         update_rubric_btn, # btn_from_rubric
                         False, # marker_btn_state
-                        False  # rubric_btn_state
+                        False, # rubric_btn_state
+                        can_custom,
+                        gr.update(visible=False, value="")
                     )
 
-            # --- 西京高校以外（通常）の場合 ---
             else:
                 return (
                     gr.update(value=f'<div style="text-align: center;" translate="no"><h1> {selected_quiz} </h1></div><div style="border: 3px solid #2196f3;padding: 24px;border-radius: 8px;text-align: center;" translate="no"> \n{quiz_text} </div>', visible=True), # quiz_text_display
@@ -1674,7 +2196,9 @@ with gr.Blocks() as demo:
                     update_marker_btn, # btn_from_marker
                     update_rubric_btn, # btn_from_rubric
                     False, # marker_btn_state
-                    False  # rubric_btn_state
+                    False, # rubric_btn_state
+                    can_custom,
+                    gr.update(visible=False, value="")
                 )
 
         # --- dropboxに何も選択されていない場合（初期状態） ---
@@ -1701,7 +2225,9 @@ with gr.Blocks() as demo:
                 gr.update(), # btn_from_marker
                 gr.update(), # btn_from_rubric
                 False, # marker_btn_state
-                False  # rubric_btn_state
+                False, # rubric_btn_state
+                False, # ◀ 追加
+                gr.update(visible=False, value="")
             )
 
     def open_when_no_rubrics(quiz_title, all_items, contents_id, count_review):
@@ -1756,7 +2282,9 @@ with gr.Blocks() as demo:
             btn_from_marker,
             btn_from_rubric,
             marker_btn_state,
-            rubric_btn_state
+            rubric_btn_state,
+            can_use_custom_prompt_state,
+            custom_prompt_input
         ]
     ).then(
         fn=open_when_no_rubrics,
@@ -1768,19 +2296,20 @@ with gr.Blocks() as demo:
         outputs=None
     )
 
-    def toggle_marker_btn(is_selected, other_btn_state):
+    def toggle_marker_btn(is_selected, other_btn_state, can_use_custom_prompt):
         new_state = not is_selected
         new_value = "✔️ マーカーからつくる" if new_state else "マーカーからつくる"
         
         dropdown_interactive = not (new_state or other_btn_state)
         model_visible = new_state or other_btn_state
+        custom_prompt_visible = model_visible and can_use_custom_prompt # ◀ 追加
         
-        return new_state, gr.update(value=new_value, variant="primary"), gr.update(visible=new_state), gr.update(interactive=dropdown_interactive), gr.update(visible=model_visible)
+        return new_state, gr.update(value=new_value, variant="primary"), gr.update(visible=new_state), gr.update(interactive=dropdown_interactive), gr.update(visible=model_visible), gr.update(visible=custom_prompt_visible)
 
     btn_from_marker.click(
         fn=toggle_marker_btn,
-        inputs=[marker_btn_state, rubric_btn_state],
-        outputs=[marker_btn_state, btn_from_marker, marker_checkboxes, quiz_dropdown, model_options]
+        inputs=[marker_btn_state, rubric_btn_state, can_use_custom_prompt_state],
+        outputs=[marker_btn_state, btn_from_marker, marker_checkboxes, quiz_dropdown, model_options, custom_prompt_input]
     ).then(
         fn=lambda: (
         "SelectedBtnFromMarker"
@@ -1793,19 +2322,20 @@ with gr.Blocks() as demo:
         outputs=None
     )
 
-    def toggle_rubric_btn(is_selected, other_btn_state):
+    def toggle_rubric_btn(is_selected, other_btn_state, can_use_custom_prompt):
         new_state = not is_selected
         new_value = "✔️ 解答のポイントからつくる" if new_state else "解答のポイントからつくる"
         
         dropdown_interactive = not (new_state or other_btn_state)
         model_visible = new_state or other_btn_state
+        custom_prompt_visible = model_visible and can_use_custom_prompt # ◀ 追加
         
-        return new_state, gr.update(value=new_value, variant="primary"), gr.update(visible=new_state), gr.update(interactive=dropdown_interactive), gr.update(visible=model_visible)
+        return new_state, gr.update(value=new_value, variant="primary"), gr.update(visible=new_state), gr.update(interactive=dropdown_interactive), gr.update(visible=model_visible), gr.update(visible=custom_prompt_visible)
 
     btn_from_rubric.click(
         fn=toggle_rubric_btn,
-        inputs=[rubric_btn_state, marker_btn_state],
-        outputs=[rubric_btn_state, btn_from_rubric, checkboxes, quiz_dropdown, model_options]
+        inputs=[rubric_btn_state, marker_btn_state, can_use_custom_prompt_state],
+        outputs=[rubric_btn_state, btn_from_rubric, checkboxes, quiz_dropdown, model_options, custom_prompt_input]
     ).then(
         fn=lambda: (
         "SelectedBtnFromRubric"
@@ -1928,9 +2458,14 @@ with gr.Blocks() as demo:
         outputs=None
     )
 
+    MODEL_MAPPING = {
+        "o4-mini(速さ重視、普段使いにおすすめ)": "o4-mini",
+        "gpt-5(正確さ重視・遅い。より深い学習向け)": "gpt-5",
+        "llm-jp-4(日本製のモデル)": "llm-jp-4-32b-a3b-thinking"
+    }
+
     model_options.change(
-        # selectionを '(' で分割し、その最初の要素([0])を取得して、前後の空白を削除(.strip())する
-        fn=lambda selection: selection.split('(')[0].strip() if selection else "",
+        fn=lambda selection: MODEL_MAPPING.get(selection, selection.split('(')[0].strip()) if selection else "",
         inputs=[model_options],
         outputs=[model_state]
     ).then(
@@ -1945,12 +2480,48 @@ with gr.Blocks() as demo:
         outputs=None
     )
 
-    def update_when_gen_quiz_btn(quiz_title, selections, quiz_text_dict, model, lti, num_review, highlighted_yellow, highlighted_red, isrubric, ismarker, marker_selected):
+    custom_prompt_input.blur(
+        fn=lambda text: (text, "InputCustomPrompt"),
+        inputs=[custom_prompt_input],
+        outputs=[custom_prompt_state, operationname_state]
+    ).then(
+        fn=handle_logs,
+        inputs=[user_state, operationname_state, session_state, lti_state, custom_prompt_state],
+        outputs=None
+    )
+
+    def check_sensitive_prompt(text):
+        if not text.strip():
+            return False
+    
+        prompt = f"""
+            以下のテキストは、中高生向けの学習システムで生徒が入力したテキストです。
+            このテキストに、個人情報（具体的な氏名、住所、電話番号、学校名など）や、教育システムに不適切な内容（暴力、暴言、性的、差別的、公序良俗に反する表現など）が含まれているか判定してください。
+
+            含まれている場合は「True」、含まれていない場合は「False」のみを出力してください。
+
+            テキスト:
+            {text}
+        """
+        try:
+            # 判定には高速なモデルを使用
+            result = gpt_exection("gpt-4.1-nano", prompt)
+            if "True" in result or "true" in result.lower():
+                return True
+            return False
+        except Exception as e:
+            print(f"Sensitive check failed: {e}")
+            # APIエラー等の場合は、生徒の学習を止めないために一旦False(安全)として通す
+            return False
+
+    @_prime_mongo_budget
+    def update_when_gen_quiz_btn(quiz_title, selections, quiz_text_dict, model, lti, num_review, highlighted_yellow, highlighted_red, isrubric, ismarker, marker_selected, custom_prompt):
+
         review_point = "この問題は、元の問題の復習問題として、どのくらい役に立ちましたか(どのくらい他の人にオススメしたいですか)？"
         rubrics = []
         tags = []
         if isrubric:
-            rubrics = get_main_explanations(quiz_title, quiz_text_dict)
+            rubrics = get_main_explanations(quiz_title, quiz_text_dict, lti)
             rubrics = rubrics[:-1]
             selected = selections or []
             tags = ['_o_' if item in selected else '_x_' for item in rubrics]
@@ -1965,30 +2536,31 @@ with gr.Blocks() as demo:
             if "赤：応用力を試す" not in marker_selected:
                 highlighted_red = ""
         quiz_text, contents_id, page, no, school, ans, ans_page_s, ans_page_e = quiz_text_dict[quiz_title]
-        exercise_info = exercise_col.find_one({"school_id": school, "contents_id": contents_id, "page": page, "no": no})
+        exercise_info = _scoped_exercise_info(lti, {"school_id": school, "contents_id": contents_id, "page": page, "no": no})
         standard_answer = exercise_info.get("standard_answer", "")
         additional_explanation = exercise_info.get("figure_explanation", "")
 
         # reason[bittype], ans, f"{elapsed_time_creation:.2f}", prompt
-        description, new_exercise, exercise_creation_time, prompt_exercise = execute0006_ks(quiz_text, standard_answer, rubrics, tags, model, additional_explanation, find_grade(lti["context_title"]), highlighted_yellow, highlighted_red)
+        description, new_exercise, exercise_creation_time, prompt_exercise = execute0006_ks(quiz_text, standard_answer, rubrics, tags, model, additional_explanation, find_grade(lti["context_title"]), highlighted_yellow, highlighted_red, custom_prompt)
 
         tags_for_saving = [True if item in selected else False for item in rubrics]
 
         return (
             new_exercise,
             exercise_creation_time,
-            gr.update(value=description + '\n <div style="text-align: center;" translate="no">' + new_exercise + f" </div> <br>問題生成時間:" + exercise_creation_time + "秒" + "<br> 右側の入力欄に解答の過程を入力するか、紙に解いて答えを出した後、模範解答を見て確認しましょう。<br> 注意：AIの生成問題には誤りを含むことがあります。"), 
+            gr.update(value= description + '\n <div style="text-align: center;" translate="no">' + new_exercise + f" </div> <br>問題生成時間:" + exercise_creation_time + "秒" + "<br> 右側の入力欄に解答の過程を入力するか、紙に解いて答えを出した後、模範解答を見て確認しましょう。<br> 注意：AIの生成問題には誤りを含むことがあります。"), 
             gr.update(visible=True, variant="secondary", interactive=False, value="(問題の解答を作成中...)"),
             gr.update(placeholder="ここに記述してください", visible=True, interactive=True, lines=10),
             tags_for_saving,
             school,
             gr.update(label=review_point),
             prompt_exercise,
-            description
+            description,
+            custom_prompt
         )
     
     def update_when_gen_quiz_btn_2(quiz_title, selections, quiz_text_dict, model, lti, num_review, new_exercise):
-        rubrics = get_main_explanations(quiz_title, quiz_text_dict)
+        rubrics = get_main_explanations(quiz_title, quiz_text_dict, lti)
         rubrics = rubrics[:-1]
 
         # check_if_solvable(question, knowledge, num, model, grade)
@@ -2001,11 +2573,18 @@ with gr.Blocks() as demo:
             prompt_answer
         )
 
+    def pre_check_and_start(custom_prompt):
+        if custom_prompt:
+            is_sensitive = check_sensitive_prompt(custom_prompt)
+            if is_sensitive:
+                # gr.Errorを出すと、画面右上に警告メッセージが表示され、
+                # 後続の .then() が全てキャンセルされるため、ボタンを押す前の状態が維持されます。
+                raise gr.Error("⚠️ 問題が生成されませんでした。")
+        return "SubmittedCheck"
+
     gen_quiz_btn.click(
-        fn=lambda: (
-        "SubmittedCheck"
-        ),
-        inputs=None,
+        fn=pre_check_and_start,
+        inputs=[custom_prompt_input],
         outputs=[operationname_state]
     ).then(
         fn=handle_logs,
@@ -2022,15 +2601,30 @@ with gr.Blocks() as demo:
         gr.update(interactive=False),
         gr.update(interactive=False),
         gr.update(interactive=False),
+        gr.update(interactive=False),
         gr.update(visible=True, variant="secondary", interactive=False, value="(あなたの理解に最適な問題を作成中...)"),
         "CreatedQuestion",
         1
         ),
         inputs=None,
-        outputs=[vanish_btn, quiz_dropdown, checkboxes, marker_checkboxes, gen_quiz_btn, rev_quiz_btn, model_options, btn_from_marker, btn_from_rubric, answer_btn, operationname_state, gen_state]
+        outputs=[
+            vanish_btn, 
+            quiz_dropdown, 
+            checkboxes, 
+            marker_checkboxes, 
+            gen_quiz_btn, 
+            rev_quiz_btn, 
+            model_options, 
+            custom_prompt_input,  # ★ここ
+            btn_from_marker, 
+            btn_from_rubric, 
+            answer_btn, 
+            operationname_state, 
+            gen_state             # ★1を正しく受け取る
+        ]
     ).then(
         fn=update_when_gen_quiz_btn,
-        inputs=[quiz_dropdown, checkboxes, quiz_map_state, model_state, lti_state, cnt_review_state, highlighted_yellow_state, highlighted_red_state, isrubric_state, ismarker_state, marker_checkboxes],
+        inputs=[quiz_dropdown, checkboxes, quiz_map_state, model_state, lti_state, cnt_review_state, highlighted_yellow_state, highlighted_red_state, isrubric_state, ismarker_state, marker_checkboxes, custom_prompt_state],
         outputs=[exercise_state, 
                  exercise_creation_time_state,
                  exercise_output, 
@@ -2040,7 +2634,8 @@ with gr.Blocks() as demo:
                  school_state,
                  rating,
                  prompt_exercise_state,
-                 description_state]
+                 description_state, 
+                 custom_prompt_state]
     ).then(
         fn=handle_logs,
         inputs=[user_state, operationname_state, session_state, lti_state, exercise_state],
@@ -2074,11 +2669,12 @@ with gr.Blocks() as demo:
         outputs=None
     )
 
-    def update_when_rev_quiz_btn(quiz_title, quiz_text_dict):
+    @_prime_mongo_budget
+    def update_when_rev_quiz_btn(quiz_title, quiz_text_dict, lti):
         quiz_text, contents_id, page, no, school, ans, ans_page_s, ans_page_e = quiz_text_dict[quiz_title]
-        exercise_info = exercise_col.find_one({"school_id": school, "contents_id": contents_id, "page": page, "no": no})
+        exercise_info = _scoped_exercise_info(lti, {"school_id": school, "contents_id": contents_id, "page": page, "no": no})
         standard_answer = exercise_info.get("standard_answer", "")
-        rubrics = get_main_explanations(quiz_title, quiz_text_dict)
+        rubrics = get_main_explanations(quiz_title, quiz_text_dict, lti)
         if (len(rubrics) > 0) and ("上記の項目について、ひとつも理解できなかった" not in rubrics):
             rubrics.append("上記の項目について、ひとつも理解できなかった")
 
@@ -2126,7 +2722,7 @@ with gr.Blocks() as demo:
         outputs=None
     ).then(
         fn=update_when_rev_quiz_btn,
-        inputs=[quiz_dropdown, quiz_map_state],
+        inputs=[quiz_dropdown, quiz_map_state, lti_state],
         outputs=[exercise_state,
                  answer_state, 
                  exercise_output, 
@@ -2148,6 +2744,16 @@ with gr.Blocks() as demo:
         outputs=None
     )
 
+    student_answer.change(
+        fn=lambda text: (text, "InputStudentAnswer"),
+        inputs=[student_answer],
+        outputs=[user_answer_state, operationname_state]
+    ).then(
+        fn=handle_logs,
+        inputs=[user_state, operationname_state, session_state, lti_state, user_answer_state],
+        outputs=None
+    )
+
     def update_when_answer_btn(solver, answer_time):
         if answer_time:
             return '<div style="text-align: center;" translate="no">' + solver + f"</div> 解答生成時間: {answer_time}秒" + "<br> 注意：AIの生成した解答には誤りを含むことがあります。"
@@ -2155,6 +2761,8 @@ with gr.Blocks() as demo:
             return '<div style="text-align: center;" translate="no">' + solver + "</div> <br> 注意：AIの生成した解答には誤りを含むことがあります。"
     
     def appear_questionnaire_box(is_gen, rubrics):
+        rubrics = rubrics or []
+
         if is_gen == 1: #類題を作った場合
             return (
                 gr.update(visible=True),
@@ -2164,7 +2772,7 @@ with gr.Blocks() as demo:
                 gr.update(visible=False, interactive=True), #fluency
                 gr.update(visible=True, interactive=True), #relevance
                 gr.update(visible=True, interactive=True), #rating
-                gr.update(visible=True, interactive=False),
+                gr.update(visible=True, interactive=False), #answer_btn
                 gr.update(visible=False, interactive=True), #report_type
                 gr.update(visible=True, interactive=True), #report_text
                 gr.update(visible=True),
@@ -2189,7 +2797,7 @@ with gr.Blocks() as demo:
                     gr.update(visible=False, interactive=False), #fluency
                     gr.update(visible=False, interactive=False), #relevance
                     gr.update(visible=False, interactive=False), #rating
-                    gr.update(visible=True, interactive=False),
+                    gr.update(visible=True, interactive=False), #answer_btn
                     gr.update(visible=False, interactive=True), #report_type
                     gr.update(visible=True, interactive=True), #report_text
                     gr.update(visible=True),
@@ -2209,11 +2817,11 @@ with gr.Blocks() as demo:
                     gr.update(visible=True),
                     gr.update(visible=False, interactive=False, show_label=False),
                     gr.update(visible=True, interactive=True), #understanding
-                    gr.update(visible=False, interactive=True), #difficulty
+                    gr.update(visible=False, interactive=False), #difficulty
                     gr.update(visible=False, interactive=False), #fluency
                     gr.update(visible=False, interactive=False), #relevance
                     gr.update(visible=False, interactive=False), #rating
-                    gr.update(visible=True, interactive=False),
+                    gr.update(visible=True, interactive=False), #answer_btn
                     gr.update(visible=False, interactive=True), #report_type
                     gr.update(visible=True, interactive=True), #report_text
                     gr.update(visible=True),
@@ -2229,7 +2837,18 @@ with gr.Blocks() as demo:
                     "AnsweredExercise"
                 )
 
-    def get_next_no_for_user(user_name, save, contents_id, page, no):
+    @_prime_mongo_budget
+    def get_next_no_for_user(user_name, save, contents_id, page, no, lti):
+        if lti.get("lti_version") == "1.3":
+            scope = _prime_lti_scope(lti)
+            store = PrimeStore(quiz_generator_db)
+            store.authorize(scope)
+            if not save:
+                if contents_id == "ai_generated":
+                    page = scope.learner_id
+                return contents_id, page, no
+            # Opaque references remain unique across concurrent generation attempts.
+            return "ai_generated", scope.learner_id, uuid.uuid4().hex
         if save:
             # 該当ユーザのレコードを全件取得
             records = list(exercise_col.find({
@@ -2240,8 +2859,17 @@ with gr.Blocks() as demo:
             if len(records)==0:
                 return "ai_generated", user_name, "1"  # 該当がなければ1からスタート
 
-            # no を整数に変換して最大値を探す
-            max_no = max(int(record.get("no", 0)) for record in records)
+            # ◀ 【修正】noを整数に変換する際、文字列("sample_1"等)が含まれていたら無視する安全な処理
+            valid_nos = []
+            for record in records:
+                try:
+                    val = int(record.get("no", 0))
+                    valid_nos.append(val)
+                except (ValueError, TypeError):
+                    pass # 数字に変換できないものはスキップ
+            
+            # 最大値を取得（もし全て無効な文字列だった場合は0を返す）
+            max_no = max(valid_nos) if valid_nos else 0
 
             return "ai_generated", user_name, str(max_no + 1)
         else:
@@ -2277,11 +2905,11 @@ with gr.Blocks() as demo:
                  operationname_state]
     ).then(
         fn=get_next_no_for_user,
-        inputs=[user_state, exercise_saving_state, contentsid_state, page_state, no_state],
+        inputs=[user_state, exercise_saving_state, contentsid_state, page_state, no_state, lti_state],
         outputs=[new_contentsid_state, new_page_state, new_no_state]
     ).then(
         fn=handle_exercise,
-        inputs=[contentsid_state, page_state, no_state, exercise_saving_state, new_no_state, exercise_state, answer_state, user_state, exercise_creation_time_state, answer_creation_time_state, model_state, session_state, lti_state, prompt_exercise_state, prompt_answer_state],
+        inputs=[contentsid_state, page_state, no_state, exercise_saving_state, new_no_state, exercise_state, answer_state, user_state, exercise_creation_time_state, answer_creation_time_state, model_state, session_state, lti_state, prompt_exercise_state, prompt_answer_state, custom_prompt_state],
         outputs=None
     ).then(
         fn=handle_logs,
@@ -2442,7 +3070,7 @@ with gr.Blocks() as demo:
         outputs=[report_btn]
     ).then(
         fn=handle_answer,
-        inputs=[exercise_state, answer_state, exercise_saving_state, user_state, session_state, contentsid_state, page_state, no_state, highlighted_yellow_state, highlighted_red_state, checkbox_state, marker_checkboxes, school_state, new_contentsid_state, new_page_state, new_no_state, description_state, student_answer, understanding, rating, difficulty, fluency, relevance, new_checkbox_state, lti_state, report_type, report_text],
+        inputs=[exercise_state, answer_state, exercise_saving_state, user_state, session_state, contentsid_state, page_state, no_state, highlighted_yellow_state, highlighted_red_state, checkbox_state, marker_checkboxes, school_state, new_contentsid_state, new_page_state, new_no_state, description_state, user_answer_state, understanding, rating, difficulty, fluency, relevance, new_checkbox_state, lti_state, report_type, report_text],
         outputs=None
     ).then(
         fn=lambda: (
@@ -2478,6 +3106,7 @@ with gr.Blocks() as demo:
             gr.update(visible=False, interactive=False), # answer_btn
             gr.update(visible=False, value=""), # answer_output
             gr.update(visible=False, interactive=True, value="o4-mini(速さ重視、普段使いにおすすめ)"), # model_options
+            gr.update(visible=False, interactive=True, value=""), # custom_prompt_input
             gr.update(visible=False, interactive=False, value=None), # understanding
             gr.update(visible=False, interactive=False, value=None), # difficulty
             gr.update(visible=False, interactive=False, value=None), # fluency
@@ -2510,6 +3139,8 @@ with gr.Blocks() as demo:
             "", # no_state,
             "", # description_state
             "", "", # prompt_exercise_state, prompt_answer_state
+            "", # custom_prompt_state
+            "", # user_answer_state
             "", "", # highlighted_red_state, highlighted_yellow_state
             "o4-mini", # model_state
             True # exercise_saving_state
@@ -2538,6 +3169,7 @@ with gr.Blocks() as demo:
             answer_btn,
             answer_output,
             model_options,
+            custom_prompt_input,
             understanding,
             difficulty,
             fluency,
@@ -2570,6 +3202,8 @@ with gr.Blocks() as demo:
             no_state,
             description_state,
             prompt_exercise_state, prompt_answer_state,
+            custom_prompt_state,
+            user_answer_state,
             highlighted_red_state, highlighted_yellow_state,
             model_state, 
             exercise_saving_state
@@ -2610,10 +3244,6 @@ with gr.Blocks() as demo:
         fn=load_session_info,
         inputs=None,
         outputs=[lti_state, user_state]
-    ).then(
-        fn=initial_register,
-        inputs=None,
-        outputs=None
     ).then(
         fn=get_contents_dict_from_clickhouse,
         inputs=[lti_state],

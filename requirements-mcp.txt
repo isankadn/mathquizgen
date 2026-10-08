@@ -1,0 +1,14 @@
+# Independent service environment; do not upgrade the Gradio environment.
+# SDK metadata supports Starlette 0.41.3 on Python 3.10-3.13.
+# Pin SSE 3.0.3: later SSE releases may require newer Starlette.
+mcp==2.1.1
+sse-starlette==3.0.3
+fastapi==0.115.6
+starlette==0.41.3
+pymongo==4.3.3
+uvicorn[standard]==0.34.0
+# Import-safe LTI registration validation, shared with the existing adapter.
+pylti1p3next==2.0.2
+PyJWT[crypto]==2.10.1
+requests==2.32.3
+jwcrypto==1.5.6

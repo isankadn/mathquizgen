@@ -2,3 +2,7 @@
 docker-compose.yml
 __pycache__/
 .pytest_cache/
+.dev-runtime/
+.venv-mcp/
+.env.*
+!.env.example

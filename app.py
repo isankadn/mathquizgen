@@ -18,6 +18,7 @@ from lti13 import (
     env_flag,
     read_request_data,
 )
+from prime_gradio_auth import NativeGradioScopeMiddleware, native_identity
 
 
 # gradio_app.pyのASGIアプリをインポート！
@@ -27,6 +28,7 @@ from gradio_evaluation_app import demo as demo2
 
 #general
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 import gradio as gr
 
@@ -63,6 +65,9 @@ session_secret = os.getenv("FASTAPI_SECRET_KEY", "")
 if len(session_secret) < 32:
     raise RuntimeError("FASTAPI_SECRET_KEY must contain at least 32 characters.")
 session_https_only = env_flag("SESSION_HTTPS_ONLY", False)
+app.add_middleware(
+    NativeGradioScopeMiddleware, blocks=demo1, path=f"/{path_prefix}/ui",
+)
 app.add_middleware(
     SessionMiddleware,
     secret_key=session_secret,
@@ -176,6 +181,8 @@ async def get_current_user(request: Request): # Dependsと関わってくる
 
 def gradio_auth_dependency(request: Request):
     user = request.session.get("user", {})
+    if isinstance(user, dict) and user.get("lti_version") == "1.3":
+        return native_identity(request.session)
     user_id = user.get("user_id") if isinstance(user, dict) else None
     return str(user_id) if user_id else None
 
@@ -324,12 +331,18 @@ async def go_to_gradio():
 app.include_router(router, prefix=f"/{path_prefix}")
 
 # Gradio Mount（/ui以下はGradio専用にする！）
+# Gradio file routes must not expose source, bootstrap secrets or signing keys.
+blocked_paths = [str(Path(__file__).resolve().parent)]
+private_key_file = os.getenv("LTI13_PRIVATE_KEY_FILE", "").strip()
+if private_key_file:
+    blocked_paths.append(str(Path(private_key_file).resolve()))
 mount_gradio_app(
     app,
     demo1,
     path=f"/{path_prefix}/ui",
     root_path=f"/{path_prefix}/ui",
     auth_dependency=gradio_auth_dependency,
+    blocked_paths=blocked_paths,
 )
 
 if __name__ == '__main__':

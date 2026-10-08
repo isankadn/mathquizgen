@@ -198,6 +198,9 @@ class PlatformRegistration:
             raise LTI13ConfigurationError("At least one deployment ID is required.")
         if len(set(self.deployment_ids)) != len(self.deployment_ids):
             raise LTI13ConfigurationError("Deployment IDs must be unique.")
+        if ("::" in self.issuer or self.issuer.endswith(":")
+                or any("::" in deployment or deployment.startswith(":") for deployment in self.deployment_ids)):
+            raise LTI13ConfigurationError("Issuer and deployment IDs must have an unambiguous namespace boundary.")
         validate_url(self.issuer, "Issuer", allow_http=allow_http)
         validate_url(
             self.auth_login_url, "OIDC authentication endpoint", allow_http=allow_http
@@ -238,6 +241,10 @@ class PlatformRepository:
             [("issuer", ASCENDING), ("client_id", ASCENDING)],
             unique=True,
             name="lti13_issuer_client_unique",
+        )
+        self.collection.create_index(
+            [("issuer", ASCENDING), ("deployment_ids", ASCENDING)],
+            unique=True, name="lti13_issuer_deployment_unique",
         )
         self.state_collection.create_index(
             [("expires_at", ASCENDING)], expireAfterSeconds=0, name="lti13_state_ttl"
@@ -479,14 +486,21 @@ class FastAPICookieService(CookieService):
     def update_response(self, response: Response) -> Response:
         secure = self.request.is_secure()
         for key, cookie_data in self.cookies_to_set.items():
+            local_http_state = (
+                not secure and env_flag("LTI13_ALLOW_INSECURE_HTTP", False)
+                and key.startswith(f"{self._cookie_prefix}-state-")
+            )
+            # Approved HTTP development only: a fresh default-SameSite cookie
+            # permits Chromium's short top-level POST grace period. State
+            # cookie comparison remains mandatory; production uses Secure/None.
             response.set_cookie(
                 key=key,
                 value=cookie_data["value"],
-                max_age=cookie_data["exp"],
+                max_age=min(120 if cookie_data["exp"] is None else cookie_data["exp"], 120) if local_http_state else cookie_data["exp"],
                 secure=secure,
                 path="/",
                 httponly=True,
-                samesite="none" if secure else "lax",
+                samesite=None if local_http_state else ("none" if secure else "lax"),
             )
         return response
 
