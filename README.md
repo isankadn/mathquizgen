@@ -94,6 +94,16 @@ Native UI: `http://10.236.173.129:7863/mathquizgen/ui/` (development ingress ope
 MCP: `http://10.236.173.129:7864/mcp` (no remote firewall ingress; same-host Meta
 can reach it). Direct UI access still requires a signed LTI session.
 
+Existing PRIME LTI administration:
+`http://10.236.173.129:13861/prime_dashboard/admin/lti13`
+(redirects to `/prime_dashboard/admin/lti13/login`; uses the server-side
+`LTI13_ADMIN_TOKEN`, not the MCP bearer or Meta-Agent admin password).
+This console manages the original PRIME stack on ports `13861`/`13862`
+and a different Mongo database. It does **not** configure the dedicated
+Meta-Agent development instance on ports `7863`/`7864`. Configure that
+instance through Meta-Agent's LTI tools and **Provision PRIME platform**
+action described below.
+
 Both Uvicorn processes reload Python, template, and static source changes;
 runtime/secrets, `.git`, and `.env` changes are excluded. No access log or
 untrusted proxy-header processing is enabled. Ctrl-C/termination stops only
@@ -190,7 +200,9 @@ Environment/configuration changes need an authorized launcher restart.
 ### Administrator binding and platform provisioning
 
 Sign in with the existing super-admin account at
-`https://dev.let.media.kyoto-u.ac.jp/meta-agent-dev/admin/login`, then open
+`https://dev.let.media.kyoto-u.ac.jp/meta-agent-dev/admin/login`.
+Register the dedicated PRIME tool and its resource at
+`https://dev.let.media.kyoto-u.ac.jp/meta-agent-dev/admin/lti-tools`, then open
 `https://dev.let.media.kyoto-u.ac.jp/meta-agent-dev/admin/mcp` in the same browser.
 The login form has rendered, but authenticated public setup/provisioning has not
 been exercised. Secure, host-only admin cookies do not transfer to private-IP
